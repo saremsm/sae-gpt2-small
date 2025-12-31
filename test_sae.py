@@ -72,6 +72,10 @@ class TestInit:
         norms = sae.W_dec.norm(dim=1)
         assert torch.allclose(norms, torch.ones(N_FEATURES), atol=1e-5)
 
+    def test_encoder_tied_to_decoder_transpose_at_init(self, sae):
+        """tied init: W_enc = W_dec.T at construction time"""
+        assert torch.allclose(sae.W_enc, sae.W_dec.T, atol=1e-6)
+
     def test_no_normalize_when_flag_off(self):
         config = SAEConfig(
             d_model=D_MODEL,
@@ -132,4 +136,5 @@ class TestProjectDecoderGrad:
         sgd.step()
 
         norms_after = sae.W_dec.norm(dim=1)
+        # |W + lr*g_perp| = sqrt(1 + lr^2 |g_perp|^2) -> ~1 not exactly 1
         assert torch.allclose(norms_after, norms_before, atol=1e-3)

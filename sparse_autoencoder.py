@@ -41,8 +41,7 @@ class SparseAutoencoder(nn.Module):
             W_dec = W_dec / W_dec.norm(dim=1, keepdim=True).clamp(min=1e-8)
 
         self.W_dec = nn.Parameter(W_dec)
-        self.W_enc = nn.Parameter(torch.empty(d, f))
-        nn.init.kaiming_uniform_(self.W_enc)
+        self.W_enc = nn.Parameter(W_dec.T.clone())
         self.b_enc = nn.Parameter(torch.zeros(f))
         self.b_dec = nn.Parameter(torch.zeros(d))
 
