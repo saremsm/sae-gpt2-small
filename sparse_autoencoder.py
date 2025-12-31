@@ -14,6 +14,7 @@ class SAEConfig:
     l1_coefficient: float = 8e-4
     lr: float = 2e-4
     warmup_steps: int = 1000
+    normalize_decoder: bool = True
 
     @property
     def expansion_factor(self) -> float:
@@ -35,11 +36,31 @@ class SparseAutoencoder(nn.Module):
         self.config = config
         d, f = config.d_model, config.n_features
 
+        W_dec = torch.randn(f, d)
+        if config.normalize_decoder:
+            W_dec = W_dec / W_dec.norm(dim=1, keepdim=True).clamp(min=1e-8)
+
+        self.W_dec = nn.Parameter(W_dec)
         self.W_enc = nn.Parameter(torch.empty(d, f))
         nn.init.kaiming_uniform_(self.W_enc)
-        self.W_dec = nn.Parameter(torch.randn(f, d))
         self.b_enc = nn.Parameter(torch.zeros(f))
         self.b_dec = nn.Parameter(torch.zeros(d))
+
+    # Decoder constraint
+    def normalize_decoder(self) -> None:
+        with torch.no_grad():
+            norms = self.W_dec.norm(dim=1, keepdim=True)
+            self.W_dec.data /= norms.clamp(min=1e-8)
+
+    def project_decoder_grad(self) -> None:
+        if self.W_dec.grad is None:
+            return
+        with torch.no_grad():
+            W = self.W_dec.data
+            grad = self.W_dec.grad
+            norms_sq = (W * W).sum(dim=1, keepdim=True).clamp(min=1e-8)
+            inner = (grad * W).sum(dim=1, keepdim=True)
+            grad.sub_((inner / norms_sq) * W)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         x_centered = x - self.b_dec
