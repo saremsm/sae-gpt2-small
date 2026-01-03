@@ -45,6 +45,11 @@ class SparseAutoencoder(nn.Module):
         self.b_enc = nn.Parameter(torch.zeros(f))
         self.b_dec = nn.Parameter(torch.zeros(d))
 
+        self.register_buffer(
+            "feature_activation_counts",
+            torch.zeros(f, dtype=torch.long),
+        )
+
     # Decoder constraint
     def normalize_decoder(self) -> None:
         with torch.no_grad():
@@ -79,6 +84,9 @@ class SparseAutoencoder(nn.Module):
 
         l0 = (h > 0).float().sum(dim=-1).mean()
 
+        with torch.no_grad():
+            self.feature_activation_counts += (h > 0).long().sum(dim=0)
+
         return SAEOutput(
             reconstructed=x_reconstructed,
             features=h,
@@ -87,3 +95,42 @@ class SparseAutoencoder(nn.Module):
             sparsity_loss=sparsity_loss,
             l0=l0,
         )
+
+    # Dead-feature handling
+    def get_dead_features(self, threshold: int = 0) -> torch.Tensor:
+        return (self.feature_activation_counts <= threshold).nonzero(
+            as_tuple=True
+        )[0]
+
+    def resample_dead_features(
+        self,
+        dead_feature_indices: torch.Tensor,
+        activations: torch.Tensor,
+        errors: torch.Tensor,
+    ) -> None:
+        """Reinitialize dead features toward high-reconstruction-error examples
+        (sampled proportional to error, not uniformly)."""
+        if len(dead_feature_indices) == 0:
+            return
+
+        n_dead = len(dead_feature_indices)
+
+        error_weights = errors / errors.sum().clamp(min=1e-8)
+        sampled_indices = torch.multinomial(
+            error_weights,
+            num_samples=n_dead,
+            replacement=True,
+        )
+        sampled_activations = activations[sampled_indices]
+
+        with torch.no_grad():
+            directions = sampled_activations - self.b_dec
+            directions = directions / (
+                directions.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            )
+
+            self.W_enc.data[:, dead_feature_indices] = directions.T * 0.2
+            self.b_enc.data[dead_feature_indices] = 0.0
+            self.W_dec.data[dead_feature_indices] = directions
+
+            self.feature_activation_counts.zero_()

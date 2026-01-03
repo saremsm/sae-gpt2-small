@@ -138,3 +138,28 @@ class TestProjectDecoderGrad:
         norms_after = sae.W_dec.norm(dim=1)
         # |W + lr*g_perp| = sqrt(1 + lr^2 |g_perp|^2) -> ~1 not exactly 1
         assert torch.allclose(norms_after, norms_before, atol=1e-3)
+
+
+class TestResampleDeadFeatures:
+    def test_get_dead_features_finds_correct_indices(self, sae):
+        sae.feature_activation_counts[:10] = torch.arange(1, 11, dtype=torch.long)
+        sae.feature_activation_counts[10:] = 0
+
+        dead_indices = sae.get_dead_features(threshold=0)
+        assert dead_indices.tolist() == list(range(10, N_FEATURES))
+
+    def test_all_counts_zeroed_after_resample(self, sae):
+        sae.feature_activation_counts[:10] = torch.arange(1, 11, dtype=torch.long)
+        sae.feature_activation_counts[10:] = 0
+
+        dead_indices = sae.get_dead_features(threshold=0)
+        activations = torch.randn(BATCH_SIZE, D_MODEL)
+        errors = torch.rand(BATCH_SIZE)
+
+        sae.resample_dead_features(
+            dead_feature_indices=dead_indices,
+            activations=activations,
+            errors=errors,
+        )
+
+        assert (sae.feature_activation_counts == 0).all().item()

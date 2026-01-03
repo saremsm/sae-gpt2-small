@@ -126,6 +126,7 @@ class TrainingHistory(TypedDict):
     reconstruction_loss: list[float]
     sparsity_loss: list[float]
     l0: list[float]
+    dead_features: list[int]
 
 
 def _make_lr_lambda(warmup_steps: int):
@@ -139,6 +140,7 @@ def train_sae(
     sae: SparseAutoencoder,
     activation_source: ActivationSource,
     n_training_tokens: int = 5_000_000,
+    resample_interval: int = 5_000,
     log_interval: int = 100,
     device: str = "cpu",
     seed: int = 42,
@@ -161,6 +163,7 @@ def train_sae(
         "reconstruction_loss": [],
         "sparsity_loss": [],
         "l0": [],
+        "dead_features": [],
     }
 
     print("=" * 60)
@@ -182,7 +185,7 @@ def train_sae(
     pbar = tqdm(total=n_training_tokens, unit="tok")
 
     while tokens_trained < n_training_tokens:
-        # fill a fresh buffer of source chunks, draw a single batch from it.
+        # fill a fresh buffer of source chunks, draw a single batch from it, and discard the rest
         chunks: list[torch.Tensor] = []
         while len(chunks) < BUFFER_CHUNKS:
             try:
@@ -215,7 +218,21 @@ def train_sae(
         tokens_trained += batch.shape[0]
         pbar.update(batch.shape[0])
 
+        if step % resample_interval == 0:
+            dead_indices = sae.get_dead_features(threshold=0)
+            if len(dead_indices) > 0:
+                with torch.no_grad():
+                    errors = (
+                        (output.reconstructed - batch).pow(2).mean(dim=-1)
+                    )
+                sae.resample_dead_features(
+                    dead_feature_indices=dead_indices,
+                    activations=batch,
+                    errors=errors,
+                )
+
         if step % log_interval == 0:
+            n_dead = len(sae.get_dead_features(threshold=0))
             current_lr = scheduler.get_last_lr()[0]
             history["step"].append(step)
             history["loss"].append(output.loss.item())
@@ -224,10 +241,12 @@ def train_sae(
             )
             history["sparsity_loss"].append(output.sparsity_loss.item())
             history["l0"].append(output.l0.item())
+            history["dead_features"].append(n_dead)
             pbar.set_postfix(
                 {
                     "loss": f"{output.loss.item():.3f}",
                     "L0": f"{output.l0.item():.1f}",
+                    "dead": n_dead,
                     "lr": f"{current_lr:.2e}",
                 }
             )
@@ -237,4 +256,8 @@ def train_sae(
         print("\nTraining complete.")
         print(f"  Final loss        : {history['loss'][-1]:.4f}")
         print(f"  Final L0          : {history['l0'][-1]:.1f}")
+        print(
+            f"  Dead features     : {history['dead_features'][-1]} / "
+            f"{sae.config.n_features}"
+        )
     return history
