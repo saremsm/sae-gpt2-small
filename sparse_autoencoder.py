@@ -11,7 +11,7 @@ from typing import NamedTuple
 class SAEConfig:
     d_model: int
     n_features: int
-    l1_coefficient: float = 8e-4
+    l1_coefficient: float = 5e-3
     lr: float = 2e-4
     warmup_steps: int = 1000
     normalize_decoder: bool = True

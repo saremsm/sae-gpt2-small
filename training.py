@@ -127,6 +127,7 @@ class TrainingHistory(TypedDict):
     sparsity_loss: list[float]
     l0: list[float]
     dead_features: list[int]
+    act_norm: list[float]
 
 
 def _make_lr_lambda(warmup_steps: int):
@@ -164,6 +165,7 @@ def train_sae(
         "sparsity_loss": [],
         "l0": [],
         "dead_features": [],
+        "act_norm": [],
     }
 
     print("=" * 60)
@@ -185,7 +187,6 @@ def train_sae(
     pbar = tqdm(total=n_training_tokens, unit="tok")
 
     while tokens_trained < n_training_tokens:
-        # fill a fresh buffer of source chunks, draw a single batch from it, and discard the rest
         chunks: list[torch.Tensor] = []
         while len(chunks) < BUFFER_CHUNKS:
             try:
@@ -200,6 +201,10 @@ def train_sae(
 
         sample_idx = torch.randperm(buffer.shape[0])[:BATCH_SIZE]
         batch = buffer[sample_idx].to(device)
+        batch = (
+            batch / batch.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            * (sae.config.d_model ** 0.5)
+        )
 
         output = sae(batch)
 
@@ -234,6 +239,7 @@ def train_sae(
         if step % log_interval == 0:
             n_dead = len(sae.get_dead_features(threshold=0))
             current_lr = scheduler.get_last_lr()[0]
+            act_norm = batch.norm(dim=-1).mean().item()
             history["step"].append(step)
             history["loss"].append(output.loss.item())
             history["reconstruction_loss"].append(
@@ -242,11 +248,13 @@ def train_sae(
             history["sparsity_loss"].append(output.sparsity_loss.item())
             history["l0"].append(output.l0.item())
             history["dead_features"].append(n_dead)
+            history["act_norm"].append(act_norm)
             pbar.set_postfix(
                 {
                     "loss": f"{output.loss.item():.3f}",
                     "L0": f"{output.l0.item():.1f}",
                     "dead": n_dead,
+                    "act_norm": f"{act_norm:.1f}",
                     "lr": f"{current_lr:.2e}",
                 }
             )
