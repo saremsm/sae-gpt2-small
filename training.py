@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-from typing import Iterator, Protocol, runtime_checkable
+from typing import Iterator, Protocol, TypedDict, runtime_checkable
 
 import torch
+
+from sparse_autoencoder import SparseAutoencoder
+from torch.optim import AdamW
+from tqdm import tqdm
 
 try:
     from transformer_lens import HookedTransformer
@@ -109,3 +113,128 @@ class InlineActivationSource:
             batch_count += 1
             if self.max_batches is not None and batch_count >= self.max_batches:
                 return
+
+
+BATCH_SIZE = 512
+BUFFER_CHUNKS = 8
+RENORM_INTERVAL = 100
+
+
+class TrainingHistory(TypedDict):
+    step: list[int]
+    loss: list[float]
+    reconstruction_loss: list[float]
+    sparsity_loss: list[float]
+    l0: list[float]
+
+
+def _make_lr_lambda(warmup_steps: int):
+    def lr_lambda(step: int) -> float:
+        return min(1.0, (step + 1) / max(1, warmup_steps))
+
+    return lr_lambda
+
+
+def train_sae(
+    sae: SparseAutoencoder,
+    activation_source: ActivationSource,
+    n_training_tokens: int = 5_000_000,
+    log_interval: int = 100,
+    device: str = "cpu",
+    seed: int = 42,
+) -> TrainingHistory:
+    torch.manual_seed(seed)
+    if device == "cuda":
+        torch.cuda.manual_seed_all(seed)
+    sae = sae.to(device)
+    sae.train()
+
+    optimizer = AdamW(sae.parameters(), lr=sae.config.lr, weight_decay=0.0)
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lr_lambda=_make_lr_lambda(sae.config.warmup_steps)
+    )
+
+    history: TrainingHistory = {
+        "step": [],
+        "loss": [],
+        "reconstruction_loss": [],
+        "sparsity_loss": [],
+        "l0": [],
+    }
+
+    print("=" * 60)
+    print("Training SAE")
+    print(
+        f"  Features      : {sae.config.n_features} "
+        f"(d_model={sae.config.d_model})"
+    )
+    print(
+        f"  LR schedule   : {sae.config.lr} with "
+        f"{sae.config.warmup_steps}-step warmup"
+    )
+    print(f"  Target tokens : {n_training_tokens:,}")
+    print()
+
+    src_iter = iter(activation_source)
+    step = 0
+    tokens_trained = 0
+    pbar = tqdm(total=n_training_tokens, unit="tok")
+
+    while tokens_trained < n_training_tokens:
+        # fill a fresh buffer of source chunks, draw a single batch from it.
+        chunks: list[torch.Tensor] = []
+        while len(chunks) < BUFFER_CHUNKS:
+            try:
+                chunks.append(next(src_iter))
+            except StopIteration:
+                # source exhausted: restart it and keep filling
+                src_iter = iter(activation_source)
+
+        buffer = torch.cat(chunks, dim=0)
+        if buffer.shape[0] < BATCH_SIZE:
+            break
+
+        sample_idx = torch.randperm(buffer.shape[0])[:BATCH_SIZE]
+        batch = buffer[sample_idx].to(device)
+
+        output = sae(batch)
+
+        optimizer.zero_grad()
+        output.loss.backward()
+        if sae.config.normalize_decoder:
+            sae.project_decoder_grad()
+        torch.nn.utils.clip_grad_norm_(sae.parameters(), max_norm=1.0)
+        optimizer.step()
+        scheduler.step()
+
+        if sae.config.normalize_decoder and step % RENORM_INTERVAL == 0:
+            sae.normalize_decoder()
+
+        step += 1
+        tokens_trained += batch.shape[0]
+        pbar.update(batch.shape[0])
+
+        if step % log_interval == 0:
+            current_lr = scheduler.get_last_lr()[0]
+            history["step"].append(step)
+            history["loss"].append(output.loss.item())
+            history["reconstruction_loss"].append(
+                output.reconstruction_loss.item()
+            )
+            history["sparsity_loss"].append(output.sparsity_loss.item())
+            history["l0"].append(output.l0.item())
+            pbar.set_postfix(
+                {
+                    "loss": f"{output.loss.item():.3f}",
+                    "L0": f"{output.l0.item():.1f}",
+                    "lr": f"{current_lr:.2e}",
+                }
+            )
+
+    pbar.close()
+    if history["loss"]:
+        print("\nTraining complete.")
+        print(f"  Final loss        : {history['loss'][-1]:.4f}")
+        print(f"  Final L0          : {history['l0'][-1]:.1f}")
+    return history
