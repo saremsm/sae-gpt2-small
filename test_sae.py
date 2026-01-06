@@ -163,3 +163,36 @@ class TestResampleDeadFeatures:
         )
 
         assert (sae.feature_activation_counts == 0).all().item()
+
+    def test_resample_zeros_optimizer_state(self, sae):
+        """resampled slices must zero adam moments. otherwise stale momentum drags
+        the reinit'd direction back to zero on step 1."""
+        optimizer = torch.optim.AdamW(sae.parameters(), lr=1e-3)
+
+        x = torch.randn(BATCH_SIZE, D_MODEL)
+        out = sae(x)
+        optimizer.zero_grad()
+        out.loss.backward()
+        optimizer.step()
+
+        sae.feature_activation_counts.zero_()
+        sae.feature_activation_counts[:10] = 5
+
+        dead_indices = sae.get_dead_features(threshold=0)
+        activations = torch.randn(BATCH_SIZE, D_MODEL)
+        errors = torch.rand(BATCH_SIZE)
+
+        sae.resample_dead_features(
+            dead_feature_indices=dead_indices,
+            activations=activations,
+            errors=errors,
+            optimizer=optimizer,
+        )
+
+        state_enc = optimizer.state[sae.W_enc]
+        assert (state_enc["exp_avg"][:, dead_indices] == 0).all().item()
+        assert (state_enc["exp_avg_sq"][:, dead_indices] == 0).all().item()
+
+        state_dec = optimizer.state[sae.W_dec]
+        assert (state_dec["exp_avg"][dead_indices] == 0).all().item()
+        assert (state_dec["exp_avg_sq"][dead_indices] == 0).all().item()

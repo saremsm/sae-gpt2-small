@@ -50,7 +50,7 @@ class SparseAutoencoder(nn.Module):
             torch.zeros(f, dtype=torch.long),
         )
 
-    # Decoder constraint
+    # Decoder constraint    
     def normalize_decoder(self) -> None:
         with torch.no_grad():
             norms = self.W_dec.norm(dim=1, keepdim=True)
@@ -96,7 +96,7 @@ class SparseAutoencoder(nn.Module):
             l0=l0,
         )
 
-    # Dead-feature handling
+    # Dead-feature handling    
     def get_dead_features(self, threshold: int = 0) -> torch.Tensor:
         return (self.feature_activation_counts <= threshold).nonzero(
             as_tuple=True
@@ -107,6 +107,7 @@ class SparseAutoencoder(nn.Module):
         dead_feature_indices: torch.Tensor,
         activations: torch.Tensor,
         errors: torch.Tensor,
+        optimizer: torch.optim.Optimizer | None = None,
     ) -> None:
         """Reinitialize dead features toward high-reconstruction-error examples
         (sampled proportional to error, not uniformly)."""
@@ -134,3 +135,26 @@ class SparseAutoencoder(nn.Module):
             self.W_dec.data[dead_feature_indices] = directions
 
             self.feature_activation_counts.zero_()
+
+            if optimizer is not None:
+                self._zero_optim_state(optimizer, dead_feature_indices)
+
+    def _zero_optim_state(
+        self,
+        optimizer: torch.optim.Optimizer,
+        dead: torch.Tensor,
+    ) -> None:
+        targets = [
+            (self.W_enc, 1),
+            (self.b_enc, 0),
+            (self.W_dec, 0),
+        ]
+        for param, axis in targets:
+            state = optimizer.state.get(param, {})
+            for key in ("exp_avg", "exp_avg_sq"):
+                if key not in state:
+                    continue
+                if axis == 0:
+                    state[key][dead] = 0.0
+                else:
+                    state[key][:, dead] = 0.0

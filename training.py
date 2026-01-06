@@ -1,3 +1,5 @@
+"""SAE training loop and activation extraction."""
+
 from __future__ import annotations
 
 from typing import Iterator, Protocol, TypedDict, runtime_checkable
@@ -187,6 +189,7 @@ def train_sae(
     pbar = tqdm(total=n_training_tokens, unit="tok")
 
     while tokens_trained < n_training_tokens:
+        # fill a fresh buffer of source chunks, draw a single batch from it.
         chunks: list[torch.Tensor] = []
         while len(chunks) < BUFFER_CHUNKS:
             try:
@@ -201,6 +204,7 @@ def train_sae(
 
         sample_idx = torch.randperm(buffer.shape[0])[:BATCH_SIZE]
         batch = buffer[sample_idx].to(device)
+        # normalize to norm sqrt(d_model): raw layer-8 residuals (norm ~150) make the
         batch = (
             batch / batch.norm(dim=-1, keepdim=True).clamp(min=1e-8)
             * (sae.config.d_model ** 0.5)
@@ -234,6 +238,7 @@ def train_sae(
                     dead_feature_indices=dead_indices,
                     activations=batch,
                     errors=errors,
+                    optimizer=optimizer,
                 )
 
         if step % log_interval == 0:
