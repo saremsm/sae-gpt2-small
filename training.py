@@ -1,5 +1,3 @@
-"""SAE training loop and activation extraction."""
-
 from __future__ import annotations
 
 from typing import Iterator, Protocol, TypedDict, runtime_checkable
@@ -118,7 +116,7 @@ class InlineActivationSource:
 
 
 BATCH_SIZE = 512
-BUFFER_CHUNKS = 8
+BUFFER_TARGET_TOKENS = 65_536
 RENORM_INTERVAL = 100
 
 
@@ -184,26 +182,51 @@ def train_sae(
     print()
 
     src_iter = iter(activation_source)
+    buffer = torch.empty(0, sae.config.d_model)
+    buffer_offset = 0
+
+    def refill_buffer() -> None:
+        nonlocal buffer, buffer_offset, src_iter
+
+        chunks: list[torch.Tensor] = []
+        if buffer_offset < buffer.shape[0]:
+            chunks.append(buffer[buffer_offset:])
+        buffer_offset = 0
+
+        total = sum(c.shape[0] for c in chunks)
+        restarts = 0
+        while total < BUFFER_TARGET_TOKENS:
+            try:
+                chunk = next(src_iter)
+            except StopIteration:
+                if restarts >= 1:
+                    break
+                src_iter = iter(activation_source)
+                restarts += 1
+                continue
+            chunks.append(chunk)
+            total += chunk.shape[0]
+
+        if not chunks or total == 0:
+            buffer = torch.empty(0, sae.config.d_model)
+            return
+
+        flat = torch.cat(chunks, dim=0)
+        perm = torch.randperm(flat.shape[0])
+        buffer = flat[perm].contiguous()
+
     step = 0
     tokens_trained = 0
     pbar = tqdm(total=n_training_tokens, unit="tok")
 
     while tokens_trained < n_training_tokens:
-        # fill a fresh buffer of source chunks, draw a single batch from it.
-        chunks: list[torch.Tensor] = []
-        while len(chunks) < BUFFER_CHUNKS:
-            try:
-                chunks.append(next(src_iter))
-            except StopIteration:
-                # source exhausted: restart it and keep filling
-                src_iter = iter(activation_source)
+        if buffer.shape[0] - buffer_offset < BATCH_SIZE:
+            refill_buffer()
+            if buffer.shape[0] - buffer_offset < BATCH_SIZE:
+                break
 
-        buffer = torch.cat(chunks, dim=0)
-        if buffer.shape[0] < BATCH_SIZE:
-            break
-
-        sample_idx = torch.randperm(buffer.shape[0])[:BATCH_SIZE]
-        batch = buffer[sample_idx].to(device)
+        batch = buffer[buffer_offset : buffer_offset + BATCH_SIZE].to(device)
+        buffer_offset += BATCH_SIZE
         # normalize to norm sqrt(d_model): raw layer-8 residuals (norm ~150) make the
         batch = (
             batch / batch.norm(dim=-1, keepdim=True).clamp(min=1e-8)
