@@ -2,6 +2,10 @@ import torch
 import pytest
 
 from sparse_autoencoder import SparseAutoencoder, SAEConfig
+from analysis import (
+    FeatureCache,
+    find_max_activating_examples,
+)
 
 D_MODEL = 64
 N_FEATURES = 256
@@ -196,3 +200,52 @@ class TestResampleDeadFeatures:
         state_dec = optimizer.state[sae.W_dec]
         assert (state_dec["exp_avg"][dead_indices] == 0).all().item()
         assert (state_dec["exp_avg_sq"][dead_indices] == 0).all().item()
+
+
+class TestFindMaxActivatingExamples:
+    @pytest.fixture
+    def minimal_cache(self) -> FeatureCache:
+        feature_acts = torch.tensor(
+            [[0.5], [9.9], [0.1],
+             [1.0], [0.2]],
+            dtype=torch.float32,
+        )
+        return FeatureCache(
+            feature_acts=feature_acts,
+            text_offsets=torch.tensor([0, 3, 5], dtype=torch.long),
+            token_strings=[["hello", "world", "foo"], ["bar", "baz"]],
+            texts=["hello world foo", "bar baz"],
+        )
+
+    def test_returns_results(self, minimal_cache):
+        results = find_max_activating_examples(
+            minimal_cache, feature_idx=0, top_k=3
+        )
+        assert len(results) >= 1
+
+    def test_rank0_activation_value(self, minimal_cache):
+        results = find_max_activating_examples(
+            minimal_cache, feature_idx=0, top_k=3
+        )
+        assert abs(results[0]["activation"] - 9.9) < 1e-4
+
+    def test_rank0_peak_token(self, minimal_cache):
+        results = find_max_activating_examples(
+            minimal_cache, feature_idx=0, top_k=3
+        )
+        assert results[0]["peak_token"] == "world"
+
+    def test_peak_position_in_context(self, minimal_cache):
+        results = find_max_activating_examples(
+            minimal_cache, feature_idx=0, top_k=3, context_window=1
+        )
+        top = results[0]
+        assert top["context"][top["peak_position_in_context"]] == "world"
+
+    def test_descending_order(self, minimal_cache):
+        results = find_max_activating_examples(
+            minimal_cache, feature_idx=0, top_k=3
+        )
+        if len(results) >= 2:
+            for i in range(len(results) - 1):
+                assert results[i]["activation"] >= results[i + 1]["activation"]
