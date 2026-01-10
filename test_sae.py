@@ -249,3 +249,23 @@ class TestFindMaxActivatingExamples:
         if len(results) >= 2:
             for i in range(len(results) - 1):
                 assert results[i]["activation"] >= results[i + 1]["activation"]
+
+    def test_peak_at_text_boundary(self):
+        """regression: peak at flat_pos == offsets[k] for k > 0. right=False ->
+        searchsorted returns k, text_idx = k-1 (wrong). right=True -> returns"""
+        feature_acts = torch.tensor(
+            [[0.5], [0.1], [0.2],
+             [9.9], [0.3]],
+            dtype=torch.float32,
+        )
+        cache = FeatureCache(
+            feature_acts=feature_acts,
+            text_offsets=torch.tensor([0, 3, 5], dtype=torch.long),
+            token_strings=[["a", "b", "c"], ["X", "Y"]],
+            texts=["a b c", "X Y"],
+        )
+        results = find_max_activating_examples(cache, feature_idx=0, top_k=1)
+        assert results[0]["peak_token"] == "X", (
+            f"expected 'X' (first token of text 1), "
+            f"got '{results[0]['peak_token']}'"
+        )

@@ -137,10 +137,12 @@ def find_max_activating_examples(
 
         flat_pos = int(top_flat_indices[rank].item())
 
+        # right=True: peaks at offsets[k] go to text k, not k-1
         text_idx = int(
             torch.searchsorted(
                 offsets.contiguous(),
                 torch.tensor(flat_pos),
+                right=True,
             ).item()
         ) - 1
 
