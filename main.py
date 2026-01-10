@@ -1,299 +1,173 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import NamedTuple, TYPE_CHECKING, TypedDict
+import random
 
+import numpy as np
 import torch
-from torch import Tensor
 
-if TYPE_CHECKING:
-    from sparse_autoencoder import SparseAutoencoder
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+try:
     from transformer_lens import HookedTransformer
+    from datasets import load_dataset
+except ImportError as exc:
+    raise ImportError(
+        "Missing deps. Run: pip install transformer_lens datasets"
+    ) from exc
 
-# structured types
-class MaxActivatingExample(TypedDict):
-    """one top-activating example for a feature"""
-    activation: float
-    peak_token: str
-    context: list[str]
-    context_activations: list[float]
-    peak_position_in_context: int
-    full_text: str
-
-
-class TokenProjection(NamedTuple):
-    """logit-lens projection of one decoder row through the unembedding"""
-    positive_tokens: list[tuple[str, float]]
-    negative_tokens: list[tuple[str, float]]
-
-# activation cache
-
-@dataclass
-class ActivationCache:
-    """precomputed residual-stream activations for a corpus (RAW scale)"""
-    activations: list[Tensor]
-    token_strings: list[list[str]]
-    texts: list[str]
+from sparse_autoencoder import SparseAutoencoder, SAEConfig
+from training import InlineActivationSource, train_sae
+from analysis import (
+    build_activation_cache,
+    build_feature_cache,
+    find_interesting_features,
+    analyze_feature,
+)
 
 
-def build_activation_cache(
-    model: "HookedTransformer",
-    texts: list[str],
-    layer: int,
-    device: str = "cpu",
-) -> ActivationCache:
-    hook_name = f"blocks.{layer}.hook_resid_post"
+def plot_training_history(history: dict, save_path: str = "training_history.png") -> None:
+    if not history.get("step"):
+        print("No training history to plot.")
+        return
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    fig.suptitle("SAE Training History", fontsize=14)
+
+    steps = history["step"]
+
+    axes[0, 0].plot(steps, history["loss"])
+    axes[0, 0].set_title("Total loss")
+    axes[0, 0].set_xlabel("Step")
+    axes[0, 0].set_ylabel("Loss")
+    axes[0, 0].set_yscale("log")
+
+    axes[0, 1].plot(steps, history["reconstruction_loss"])
+    axes[0, 1].set_title("Reconstruction loss (MSE, normalized space)")
+    axes[0, 1].set_xlabel("Step")
+    axes[0, 1].set_ylabel("MSE")
+
+    axes[0, 2].plot(steps, history["l0"])
+    axes[0, 2].set_title("L0 (avg active features per token)")
+    axes[0, 2].set_xlabel("Step")
+    axes[0, 2].set_ylabel("Active features")
+    axes[0, 2].axhline(y=20, color="r", linestyle="--", alpha=0.5, label="target L0=20")
+    axes[0, 2].legend()
+
+    axes[1, 0].plot(steps, history["dead_features"])
+    axes[1, 0].set_title("Dead features over training")
+    axes[1, 0].set_xlabel("Step")
+    axes[1, 0].set_ylabel("Dead feature count")
+
+    if history.get("act_norm"):
+        axes[1, 1].plot(steps, history["act_norm"])
+        axes[1, 1].set_xlabel("Step")
+        axes[1, 1].set_ylabel(r"$\|x\|_2$ mean")
+        axes[1, 1].set_title("Input norm (post-normalization)")
+
+    axes[1, 2].set_visible(False)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"Training history saved to '{save_path}'")
+
+
+def main() -> None:
+    SEED = 42
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+    print(f"Using device: {device}")
+
+    print("\nLoading GPT-2-small via TransformerLens...")
+    model = HookedTransformer.from_pretrained("gpt2")
     model.eval()
-    model.to(device)
-
-    all_activations: list[Tensor] = []
-    all_token_strings: list[list[str]] = []
-
-    for text in texts:
-        tokens = model.to_tokens(text, prepend_bos=True)
-        tok_strs = model.to_str_tokens(text)
-
-        with torch.no_grad():
-            _, cache = model.run_with_cache(
-                tokens.to(device),
-                names_filter=hook_name,
-            )
-
-        acts = cache[hook_name][0].cpu()
-        acts = acts[1:]
-        tok_strs = tok_strs[1:]
-        all_activations.append(acts)
-        all_token_strings.append(tok_strs)
-
-    return ActivationCache(
-        activations=all_activations,
-        token_strings=all_token_strings,
-        texts=texts,
-    )
-
-
-# feature cache
-@dataclass
-class FeatureCache:
-    """precomputed SAE feature activations for every token in the corpus"""
-    feature_acts: Tensor
-    text_offsets: Tensor
-    token_strings: list[list[str]]
-    texts: list[str]
-
-
-def build_feature_cache(
-    sae: "SparseAutoencoder",
-    activation_cache: ActivationCache,
-    device: str = "cpu",
-    encode_batch_size: int = 2048,
-) -> FeatureCache:
-    sae = sae.to(device)
-    sae.eval()
-
-    all_feature_acts: list[Tensor] = []
-    offsets: list[int] = [0]
-
-    for acts in activation_cache.activations:
-        seq_len = acts.shape[0]
-        text_features: list[Tensor] = []
-
-        for start in range(0, seq_len, encode_batch_size):
-            chunk = acts[start : start + encode_batch_size].to(device)
-            with torch.no_grad():
-                text_features.append(sae.encode(chunk).cpu())
-
-        text_feature_tensor = torch.cat(text_features, dim=0)
-        all_feature_acts.append(text_feature_tensor)
-        offsets.append(offsets[-1] + seq_len)
-
-    return FeatureCache(
-        feature_acts=torch.cat(all_feature_acts, dim=0),
-        text_offsets=torch.tensor(offsets, dtype=torch.long),
-        token_strings=activation_cache.token_strings,
-        texts=activation_cache.texts,
-    )
-
-# queries
-def find_max_activating_examples(
-    feature_cache: FeatureCache,
-    feature_idx: int,
-    top_k: int = 10,
-    context_window: int = 5,
-) -> list[MaxActivatingExample]:
-    all_acts: Tensor = feature_cache.feature_acts[:, feature_idx]
-
-    total_tokens = all_acts.shape[0]
-    k = min(top_k, total_tokens)
-
-    top_values, top_flat_indices = all_acts.topk(k)
-
-    examples: list[MaxActivatingExample] = []
-    offsets = feature_cache.text_offsets
-
-    for rank in range(k):
-        activation_value = top_values[rank].item()
-        if activation_value <= 0:
-            break
-
-        flat_pos = int(top_flat_indices[rank].item())
-
-        # right=True: peaks at offsets[k] go to text k, not k-1
-        text_idx = int(
-            torch.searchsorted(
-                offsets.contiguous(),
-                torch.tensor(flat_pos),
-                right=True,
-            ).item()
-        ) - 1
-
-        tok_start = int(offsets[text_idx].item())
-        pos_in_text = flat_pos - tok_start
-
-        tok_strs = feature_cache.token_strings[text_idx]
-        text = feature_cache.texts[text_idx]
-
-        tok_end = int(offsets[text_idx + 1].item())
-        text_acts = all_acts[tok_start:tok_end]
-
-        ctx_start = max(0, pos_in_text - context_window)
-        ctx_end = min(len(tok_strs), pos_in_text + context_window + 1)
-
-        examples.append(
-            MaxActivatingExample(
-                activation=activation_value,
-                peak_token=tok_strs[pos_in_text],
-                context=tok_strs[ctx_start:ctx_end],
-                context_activations=text_acts[ctx_start:ctx_end].tolist(),
-                peak_position_in_context=pos_in_text - ctx_start,
-                full_text=text[:100],
-            )
-        )
-
-    examples.sort(key=lambda e: e["activation"], reverse=True)
-    return examples
-
-
-def feature_token_projection(
-    sae: "SparseAutoencoder",
-    model: "HookedTransformer",
-    feature_idx: int,
-    top_k: int = 20,
-) -> TokenProjection:
-    feature_direction = sae.W_dec[feature_idx]
-
-    with torch.no_grad():
-        logits = feature_direction @ model.W_U
-
-    top_vals, top_idxs = logits.topk(top_k)
-    bot_vals, bot_idxs = logits.topk(top_k, largest=False)
-
-    positive_tokens = [
-        (model.to_string(int(idx.item())), float(val.item()))
-        for idx, val in zip(top_idxs, top_vals)
-    ]
-    negative_tokens = [
-        (model.to_string(int(idx.item())), float(val.item()))
-        for idx, val in zip(bot_idxs, bot_vals)
-    ]
-
-    return TokenProjection(
-        positive_tokens=positive_tokens,
-        negative_tokens=negative_tokens,
-    )
-
-
-def analyze_feature(
-    sae: "SparseAutoencoder",
-    model: "HookedTransformer",
-    feature_idx: int,
-    feature_cache: FeatureCache,
-) -> None:
-    """Presentational: prints a human-readable feature report."""
-    sep = "=" * 70
-    print(f"\n{sep}")
-    print(f"Feature {feature_idx} analysis")
-    print(sep)
-
-    print("\nTop promoted tokens (logit-lens projection of decoder row):")
-    projection = feature_token_projection(sae, model, feature_idx)
-    pos_display = ", ".join(
-        f"'{t}' ({v:.2f})" for t, v in projection.positive_tokens[:10]
-    )
-    neg_display = ", ".join(
-        f"'{t}' ({v:.2f})" for t, v in projection.negative_tokens[:5]
-    )
-    print(f"  Positive : {pos_display}")
-    print(f"  Negative : {neg_display}")
-
-    print("\nTop activating contexts:")
-    examples = find_max_activating_examples(feature_cache, feature_idx, top_k=5)
-
-    for i, ex in enumerate(examples):
-        context_parts = []
-        for j, (tok, act) in enumerate(
-            zip(ex["context"], ex["context_activations"])
-        ):
-            if j == ex["peak_position_in_context"]:
-                context_parts.append(f"[{tok}|{act:.2f}]")
-            elif act > 0.1:
-                context_parts.append(f"{tok}({act:.1f})")
-            else:
-                context_parts.append(tok)
-
-        print(f"\n  Example {i + 1}: activation = {ex['activation']:.3f}")
-        print(f"  Peak token : '{ex['peak_token']}'")
-        print(f"  Context    : {''.join(context_parts)}")
-
-    print()
-
-
-def find_interesting_features(
-    feature_cache: FeatureCache,
-    sae: "SparseAutoencoder",
-    n_features_to_return: int = 50,
-    chunk_size: int = 2048,
-) -> list[int]:
-    """Rank candidate features by mean activation when active, filtered to a
-    0.1%-20% activation-rate band."""
-    fa = feature_cache.feature_acts
-
-    n_features = sae.config.n_features
-    if fa.shape[1] != n_features:
-        raise ValueError(
-            f"FeatureCache has {fa.shape[1]} features but SAE has {n_features}"
-        )
-
-    total_tokens, _ = fa.shape
-
-    feature_counts = torch.zeros(n_features, dtype=torch.float32)
-    feature_sum_acts = torch.zeros(n_features, dtype=torch.float32)
-
-    for start in range(0, total_tokens, chunk_size):
-        chunk = fa[start : start + chunk_size]
-        feature_counts += (chunk > 0).float().sum(dim=0)
-        feature_sum_acts += chunk.sum(dim=0)
-
-    rate = feature_counts / max(total_tokens, 1)
-    mean_when_active = feature_sum_acts / feature_counts.clamp(min=1)
-
-    mask = (rate > 0.001) & (rate < 0.2) & (mean_when_active > 0.5)
-    candidate_indices = mask.nonzero(as_tuple=True)[0].tolist()
-
-    ranked = sorted(
-        candidate_indices,
-        key=lambda i: mean_when_active[i].item(),
-        reverse=True,
-    )
-
     print(
-        f"Found {len(ranked)} candidate features in the "
-        f"0.1%-20% activation-rate band:"
+        f"Model: {model.cfg.n_layers} layers, "
+        f"{model.cfg.n_heads} heads, "
+        f"d_model={model.cfg.d_model}"
     )
-    for i in ranked[:n_features_to_return]:
-        print(
-            f"  feature {i:5d}: rate={rate[i]:.4f}, "
-            f"mean act when active={mean_when_active[i]:.3f}"
-        )
 
-    return ranked[:n_features_to_return]
+    TARGET_LAYER = 8
+
+    # warmup_steps=100 vs ~976 expected steps: the previous 1000 kept the whole
+    config = SAEConfig(
+        d_model=model.cfg.d_model,
+        n_features=3072,
+        l1_coefficient=5e-3,
+        lr=2e-4,
+        warmup_steps=100,
+    )
+
+    sae = SparseAutoencoder(config)
+
+    activation_source = InlineActivationSource(
+        model=model,
+        layer=TARGET_LAYER,
+        batch_size=32,
+        context_length=128,
+        device=device,
+    )
+
+    history = train_sae(
+        sae=sae,
+        activation_source=activation_source,
+        n_training_tokens=500_000,
+        resample_interval=1000,
+        log_interval=50,
+        device=device,
+        seed=SEED,
+    )
+
+    checkpoint_path = "sae_gpt2_layer8.pt"
+    torch.save(
+        {
+            "sae_state_dict": sae.state_dict(),
+            "config": config,
+            "layer": TARGET_LAYER,
+            "training_history": history,
+        },
+        checkpoint_path,
+    )
+    print(f"\nModel saved to '{checkpoint_path}'")
+
+    plot_training_history(history)
+
+    print("\nLoading analysis texts...")
+    dataset = load_dataset("NeelNanda/pile-10k", split="train", trust_remote_code=True)
+    analysis_texts = [
+        item.get("text", "")
+        for item in list(dataset)[:200]
+        if len(item.get("text", "")) > 100
+    ][:100]
+    print(f"Loaded {len(analysis_texts)} texts for analysis.")
+
+    print("Building activation cache (one model forward pass per text)...")
+    act_cache = build_activation_cache(model, analysis_texts, TARGET_LAYER, device=device)
+
+    print("Building feature cache (one SAE encode pass per text)...")
+    feat_cache = build_feature_cache(sae, act_cache, device=device)
+
+    interesting = find_interesting_features(feat_cache, sae)
+
+    n_to_show = min(5, len(interesting))
+    print(f"\nAnalyzing {n_to_show} interesting features:")
+    for feature_idx in interesting[:n_to_show]:
+        analyze_feature(sae, model, feature_idx, feat_cache)
+
+    print("\nReflection: see README.md.")
+
+
+if __name__ == "__main__":
+    main()

@@ -12,6 +12,12 @@ python main.py
 
 `main.py` trains a 3072-feature SAE at layer 8 for 500K tokens, saves the checkpoint, plots curves, and prints analysis for the most interpretable features it finds.
 
+## bugs fixed
+
+Config-level bugs, caught after the first full training runs. Each fix is described with its mechanism, matching the pattern in the notes section below.
+
+1. **The entire run happened inside LR warmup.** 500K tokens / 512-token batches is ~976 steps, against `warmup_steps=1000` - the learning rate ramped toward 2e-4 and the run ended before reaching it, so every number in the table below was produced at a fraction of the configured LR. Fix: `warmup_steps=100`, plus a clamp-with-warning in `train_sae` so this failure mode can't recur silently.
+
 ## numbers
 
 Measured on a Lambda A10 (24 GB): ~32s wall-clock for 500K tokens, plus ~30s for analysis on 100 texts.

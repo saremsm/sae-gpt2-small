@@ -154,8 +154,20 @@ def train_sae(
 
     optimizer = AdamW(sae.parameters(), lr=sae.config.lr, weight_decay=0.0)
 
+    # Guard a silent failure: the original warmup_steps=1000 vs ~976-step run
+    expected_steps = max(1, n_training_tokens // BATCH_SIZE)
+    warmup_steps = sae.config.warmup_steps
+    if warmup_steps >= expected_steps:
+        clamped = max(10, expected_steps // 20)
+        print(
+            f"WARNING: warmup_steps ({warmup_steps}) >= expected steps "
+            f"({expected_steps}); clamping warmup to {clamped} so the run "
+            f"actually reaches lr={sae.config.lr}."
+        )
+        warmup_steps = clamped
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=_make_lr_lambda(sae.config.warmup_steps)
+        optimizer, lr_lambda=_make_lr_lambda(warmup_steps)
     )
 
     history: TrainingHistory = {
@@ -176,7 +188,7 @@ def train_sae(
     )
     print(
         f"  LR schedule   : {sae.config.lr} with "
-        f"{sae.config.warmup_steps}-step warmup"
+        f"{warmup_steps}-step warmup"
     )
     print(f"  Target tokens : {n_training_tokens:,}")
     print()

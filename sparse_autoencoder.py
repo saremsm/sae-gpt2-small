@@ -13,7 +13,7 @@ class SAEConfig:
     n_features: int
     l1_coefficient: float = 5e-3
     lr: float = 2e-4
-    warmup_steps: int = 1000
+    warmup_steps: int = 100
     normalize_decoder: bool = True
 
     @property
@@ -106,6 +106,7 @@ class SparseAutoencoder(nn.Module):
         )
 
     # Dead-feature handling
+
     def get_dead_features(self, threshold: int = 0) -> torch.Tensor:
         return (self.feature_activation_counts <= threshold).nonzero(
             as_tuple=True
