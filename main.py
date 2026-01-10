@@ -1,6 +1,3 @@
-"""analysis.py - feature analysis for a trained SAE. three stages:
-build_activation_cache (model forwards, residual stream) -> build_feature_cache"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -74,8 +71,8 @@ def build_activation_cache(
         texts=texts,
     )
 
-# feature cache
 
+# feature cache
 @dataclass
 class FeatureCache:
     """precomputed SAE feature activations for every token in the corpus"""
@@ -104,7 +101,6 @@ def build_feature_cache(
         for start in range(0, seq_len, encode_batch_size):
             chunk = acts[start : start + encode_batch_size].to(device)
             with torch.no_grad():
-                # encode() applies the SAE's input normalization: raw residuals.
                 text_features.append(sae.encode(chunk).cpu())
 
         text_feature_tensor = torch.cat(text_features, dim=0)
@@ -119,7 +115,6 @@ def build_feature_cache(
     )
 
 # queries
-
 def find_max_activating_examples(
     feature_cache: FeatureCache,
     feature_idx: int,
@@ -259,9 +254,8 @@ def find_interesting_features(
     n_features_to_return: int = 50,
     chunk_size: int = 2048,
 ) -> list[int]:
-    """Rank features by mean activation when active, within a 0.1%-20% activation-
-    rate band. Takes n_features, not the SAE - the model served only a shape
-    check."""
+    """Rank candidate features by mean activation when active, filtered to a
+    0.1%-20% activation-rate band."""
     fa = feature_cache.feature_acts
 
     n_features = sae.config.n_features
