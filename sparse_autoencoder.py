@@ -50,7 +50,7 @@ class SparseAutoencoder(nn.Module):
             torch.zeros(f, dtype=torch.long),
         )
 
-    # Decoder constraint    
+    # Decoder constraint
     def normalize_decoder(self) -> None:
         with torch.no_grad():
             norms = self.W_dec.norm(dim=1, keepdim=True)
@@ -71,6 +71,14 @@ class SparseAutoencoder(nn.Module):
         pre_activations = x_centered @ self.W_enc + self.b_enc
         return F.relu(pre_activations)
 
+    def encode_raw(self, x: torch.Tensor) -> torch.Tensor:
+        """Convenience: normalize raw residuals to norm sqrt(d_model), then encode."""
+        x = (
+            x / x.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            * (self.config.d_model ** 0.5)
+        )
+        return self.encode(x)
+
     def decode(self, h: torch.Tensor) -> torch.Tensor:
         return h @ self.W_dec + self.b_dec
 
@@ -84,8 +92,9 @@ class SparseAutoencoder(nn.Module):
 
         l0 = (h > 0).float().sum(dim=-1).mean()
 
-        with torch.no_grad():
-            self.feature_activation_counts += (h > 0).long().sum(dim=0)
+        if self.training:
+            with torch.no_grad():
+                self.feature_activation_counts += (h > 0).long().sum(dim=0)
 
         return SAEOutput(
             reconstructed=x_reconstructed,
@@ -96,7 +105,7 @@ class SparseAutoencoder(nn.Module):
             l0=l0,
         )
 
-    # Dead-feature handling    
+    # Dead-feature handling
     def get_dead_features(self, threshold: int = 0) -> torch.Tensor:
         return (self.feature_activation_counts <= threshold).nonzero(
             as_tuple=True
