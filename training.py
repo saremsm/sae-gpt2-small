@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from typing import Iterator, Protocol, TypedDict, runtime_checkable
 
 import torch
@@ -118,6 +119,8 @@ class InlineActivationSource:
 BATCH_SIZE = 512
 BUFFER_TARGET_TOKENS = 65_536
 RENORM_INTERVAL = 100
+# batches feeding the resampling pool. 8 x 512 x 768 fp32 ~ 12 MB.
+RESAMPLE_POOL_BATCHES = 8
 
 
 class TrainingHistory(TypedDict):
@@ -153,7 +156,7 @@ def train_sae(
     sae.train()
 
     optimizer = AdamW(sae.parameters(), lr=sae.config.lr, weight_decay=0.0)
-
+    
     # Guard a silent failure: the original warmup_steps=1000 vs ~976-step run
     expected_steps = max(1, n_training_tokens // BATCH_SIZE)
     warmup_steps = sae.config.warmup_steps
@@ -227,6 +230,11 @@ def train_sae(
         perm = torch.randperm(flat.shape[0])
         buffer = flat[perm].contiguous()
 
+    # Rolling resampling pool: raw activations + their per-token errors from
+    resample_pool: deque[tuple[torch.Tensor, torch.Tensor]] = deque(
+        maxlen=RESAMPLE_POOL_BATCHES
+    )
+
     step = 0
     tokens_trained = 0
     pbar = tqdm(total=n_training_tokens, unit="tok")
@@ -258,6 +266,14 @@ def train_sae(
         if sae.config.normalize_decoder and step % RENORM_INTERVAL == 0:
             sae.normalize_decoder()
 
+        # clone(): CPU-path .cpu() is a no-op VIEW into the 64K-token buffer.
+        resample_pool.append(
+            (
+                batch.detach().cpu().clone(),
+                output.per_token_recon_error.cpu().clone(),
+            )
+        )
+
         step += 1
         tokens_trained += batch.shape[0]
         pbar.update(batch.shape[0])
@@ -265,16 +281,22 @@ def train_sae(
         if step % resample_interval == 0:
             dead_indices = sae.get_dead_features(threshold=0)
             if len(dead_indices) > 0:
-                with torch.no_grad():
-                    errors = (
-                        (output.reconstructed - batch).pow(2).mean(dim=-1)
-                    )
+                pool_acts = torch.cat(
+                    [acts for acts, _ in resample_pool]
+                ).to(device)
+                pool_errors = torch.cat(
+                    [errs for _, errs in resample_pool]
+                ).to(device)
                 sae.resample_dead_features(
                     dead_feature_indices=dead_indices,
-                    activations=batch,
-                    errors=errors,
+                    activations=pool_acts,
+                    errors=pool_errors,
                     optimizer=optimizer,
                 )
+            else:
+                # Fresh counting window regardless: counts were zeroed only when a resample
+                # fired.
+                sae.feature_activation_counts.zero_()
 
         if step % log_interval == 0:
             n_dead = len(sae.get_dead_features(threshold=0))

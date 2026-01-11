@@ -70,6 +70,14 @@ class TestForwardPass:
         out = sae_no_l1(x)
         assert out.l0.isfinite().item() and out.l0.item() >= 0
 
+    def test_per_token_recon_error_shape_and_grad(self, sae_no_l1):
+        """per_token_recon_error must be per-token (B,) and detached."""
+        x = torch.randn(BATCH_SIZE, D_MODEL)
+        out = sae_no_l1(x)
+        assert out.per_token_recon_error.shape == (BATCH_SIZE,)
+        assert not out.per_token_recon_error.requires_grad
+        assert (out.per_token_recon_error >= 0).all().item()
+
 
 class TestInit:
     def test_decoder_unit_norm_at_init(self, sae):

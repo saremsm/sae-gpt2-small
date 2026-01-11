@@ -28,6 +28,8 @@ class SAEOutput(NamedTuple):
     reconstruction_loss: torch.Tensor
     sparsity_loss: torch.Tensor
     l0: torch.Tensor
+    # Per-token reconstruction error (detached) - resampling weights.
+    per_token_recon_error: torch.Tensor
 
 
 class SparseAutoencoder(nn.Module):
@@ -91,6 +93,9 @@ class SparseAutoencoder(nn.Module):
         loss = reconstruction_loss + self.config.l1_coefficient * sparsity_loss
 
         l0 = (h > 0).float().sum(dim=-1).mean()
+        per_token_recon_error = (
+            (x_reconstructed - x).pow(2).mean(dim=-1).detach()
+        )
 
         if self.training:
             with torch.no_grad():
@@ -103,6 +108,7 @@ class SparseAutoencoder(nn.Module):
             reconstruction_loss=reconstruction_loss,
             sparsity_loss=sparsity_loss,
             l0=l0,
+            per_token_recon_error=per_token_recon_error,
         )
 
     # Dead-feature handling

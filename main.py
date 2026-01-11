@@ -124,7 +124,7 @@ def main() -> None:
         sae=sae,
         activation_source=activation_source,
         n_training_tokens=500_000,
-        resample_interval=1000,
+        resample_interval=250,
         log_interval=50,
         device=device,
         seed=SEED,
