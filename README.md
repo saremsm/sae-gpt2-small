@@ -20,6 +20,7 @@ One critical inconsistency and several config-level bugs, caught after the first
 2. **The entire run happened inside LR warmup.** 500K tokens / 512-token batches is ~976 steps, against `warmup_steps=1000` - the learning rate ramped toward 2e-4 and the run ended before reaching it, so every number in the table below was produced at a fraction of the configured LR. Fix: `warmup_steps=100`, plus a clamp-with-warning in `train_sae` so this failure mode can't recur silently.
 3. **Resampling never fired, and the dead-feature window was broken.** `resample_interval=1000` > 976 total steps, so the resampling machinery was never exercised in the headline run; and `feature_activation_counts` was only zeroed when a resample actually happened, so after any all-alive checkpoint the counting window grew without bound ("dead" degraded to "never fired since step 0"). Fix: interval lowered to 250 and the counter is zeroed at every resample checkpoint, giving true fixed-window semantics.
 4. **Resampling drew candidates from a single 512-token batch.** With many dead features that reinitializes near-duplicate directions from one narrow slice of data. Fix: a rolling pool of the last 8 batches' activations and per-token errors (~12 MB) feeds the sampler; `SAEOutput` now carries `per_token_recon_error` so the loop never compares the normalized-space reconstruction against raw inputs.
+5. **Variance explained wasn't FVU.** The old script compared flattened `.var()` ratios (deviation from the *global scalar* mean) - close to, but not, the FVU the literature reports. `variance_explained.py` now computes 1 - FVU properly (residual sum of squares over sum of squares about the per-dimension mean, in the SAE's normalized space).
 
 ## numbers
 
@@ -31,7 +32,7 @@ Measured on a Lambda A10 (24 GB): ~32s wall-clock for 500K tokens, plus ~30s for
 | final reconstruction MSE | 0.45 |
 | final L0 | 43 |
 | dead features at end | 0 / 3072 (but see review item 3 - the window was broken) |
-| variance explained | 55% |
+| variance explained | 55% (pre-FVU metric; see review item 5) |
 
 Three features that came out interpretable enough to describe in a sentence:
 
