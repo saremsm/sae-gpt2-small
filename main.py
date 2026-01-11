@@ -63,8 +63,11 @@ def plot_training_history(history: dict, save_path: str = "training_history.png"
     if history.get("act_norm"):
         axes[1, 1].plot(steps, history["act_norm"])
         axes[1, 1].set_xlabel("Step")
-        axes[1, 1].set_ylabel(r"$\|x\|_2$ mean")
-        axes[1, 1].set_title("Input norm (post-normalization)")
+        axes[1, 1].set_ylabel(r"$\|x\|_2$ mean (raw)")
+        axes[1, 1].set_title(
+            "Raw input norm (SAE rescales to $\\sqrt{d}$ internally)",
+            fontsize=9,
+        )
 
     axes[1, 2].set_visible(False)
 

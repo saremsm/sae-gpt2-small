@@ -1,6 +1,6 @@
 # sae-gpt2
 
-A sparse autoencoder for GPT-2-small residual streams. Trains a dictionary, handles dead features by resampling them onto high-error examples, and lets you query what each feature fires on across a corpus.
+A sparse autoencoder for GPT-2-small residual streams. Trains a dictionary, handles dead features by resampling them onto high-error examples, and lets you query what each feature fires on across a corpus. Input normalization lives inside the SAE, so the checkpoint cannot be mis-used by skipping preprocessing.
 
 ## running
 
@@ -14,11 +14,12 @@ python main.py
 
 ## bugs fixed
 
-Config-level bugs, caught after the first full training runs. Each fix is described with its mechanism, matching the pattern in the notes section below.
+One critical inconsistency and several config-level bugs, caught after the first full training runs. Each fix is described with its mechanism, matching the pattern in the notes section below.
 
-1. **The entire run happened inside LR warmup.** 500K tokens / 512-token batches is ~976 steps, against `warmup_steps=1000` - the learning rate ramped toward 2e-4 and the run ended before reaching it, so every number in the table below was produced at a fraction of the configured LR. Fix: `warmup_steps=100`, plus a clamp-with-warning in `train_sae` so this failure mode can't recur silently.
-2. **Resampling never fired, and the dead-feature window was broken.** `resample_interval=1000` > 976 total steps, so the resampling machinery was never exercised in the headline run; and `feature_activation_counts` was only zeroed when a resample actually happened, so after any all-alive checkpoint the counting window grew without bound ("dead" degraded to "never fired since step 0"). Fix: interval lowered to 250 and the counter is zeroed at every resample checkpoint, giving true fixed-window semantics.
-3. **Resampling drew candidates from a single 512-token batch.** With many dead features that reinitializes near-duplicate directions from one narrow slice of data. Fix: a rolling pool of the last 8 batches' activations and per-token errors (~12 MB) feeds the sampler; `SAEOutput` now carries `per_token_recon_error` so the loop never compares the normalized-space reconstruction against raw inputs.
+1. **The analysis pipeline fed the SAE the exact input this README warned "will produce nonsense."** Training normalized activations to norm sqrt(d_model) inside the loop only, so `analysis.py` encoded raw layer-8 residuals (norm ~150) with a model trained at ~27.7 - rankings survived (a monotone per-feature rescale) while every absolute statistic was wrong. Fix: the normalization now lives inside the SAE (`SAEConfig.normalize_input`, applied in `encode`/`forward`/`resample_dead_features`), so training, analysis, and evaluation share one contract by construction; `test_encode_scale_invariant` pins it.
+2. **The entire run happened inside LR warmup.** 500K tokens / 512-token batches is ~976 steps, against `warmup_steps=1000` - the learning rate ramped toward 2e-4 and the run ended before reaching it, so every number in the table below was produced at a fraction of the configured LR. Fix: `warmup_steps=100`, plus a clamp-with-warning in `train_sae` so this failure mode can't recur silently.
+3. **Resampling never fired, and the dead-feature window was broken.** `resample_interval=1000` > 976 total steps, so the resampling machinery was never exercised in the headline run; and `feature_activation_counts` was only zeroed when a resample actually happened, so after any all-alive checkpoint the counting window grew without bound ("dead" degraded to "never fired since step 0"). Fix: interval lowered to 250 and the counter is zeroed at every resample checkpoint, giving true fixed-window semantics.
+4. **Resampling drew candidates from a single 512-token batch.** With many dead features that reinitializes near-duplicate directions from one narrow slice of data. Fix: a rolling pool of the last 8 batches' activations and per-token errors (~12 MB) feeds the sampler; `SAEOutput` now carries `per_token_recon_error` so the loop never compares the normalized-space reconstruction against raw inputs.
 
 ## numbers
 
@@ -29,7 +30,7 @@ Measured on a Lambda A10 (24 GB): ~32s wall-clock for 500K tokens, plus ~30s for
 | training tokens | 500K |
 | final reconstruction MSE | 0.45 |
 | final L0 | 43 |
-| dead features at end | 0 / 3072 |
+| dead features at end | 0 / 3072 (but see review item 3 - the window was broken) |
 | variance explained | 55% |
 
 Three features that came out interpretable enough to describe in a sentence:
@@ -52,7 +53,7 @@ Earlier version of the training loop filled an 8-chunk buffer (~30K tokens), sam
 
 GPT-2's pad token id equals BOS/EOS, so a `tokens != pad_id` filter would also drop legitimate BOS positions. The activation source tokenizes once with HF's tokenizer (real attention mask), prepends BOS, then uses the mask to drop pad-position activations in one boolean-index op over the `(B, T, d_model)` activation tensor.
 
-First training run came out with L0=866 - the SAE was using a quarter of its 3072 features on every token. Layer 8 residuals have norm ~150, so the L1 penalty `l1_coefficient * sum(|h_i|)` was tiny relative to MSE and sparsity wasn't being optimized. Standard fix: normalize activations to a fixed norm (`sqrt(d_model)`), which decouples `l1_coefficient` from the layer's activation scale. After normalizing and bumping `l1_coefficient` from 8e-4 to 5e-3, L0 settled at ~43. That normalization lives in the training loop only, so the checkpoint expects inputs already normalized to norm sqrt(d_model) - feeding it raw residuals will produce nonsense.
+First training run came out with L0=866 - the SAE was using a quarter of its 3072 features on every token. Layer 8 residuals have norm ~150, so the L1 penalty `l1_coefficient * sum(|h_i|)` was tiny relative to MSE and sparsity wasn't being optimized. Standard fix: normalize activations to a fixed norm (`sqrt(d_model)`), which decouples `l1_coefficient` from the layer's activation scale. After normalizing and bumping `l1_coefficient` from 8e-4 to 5e-3, L0 settled at ~43. That normalization originally lived in the training loop only - which is how the analysis-path bug (item 1 above) happened; it now lives inside the SAE, where the checkpoint's input contract belongs.
 
 The first analysis pass had every "interesting" feature firing on `<|endoftext|>` because BOS has an outlier activation that monopolises every per-feature top-k. Stripping it from the analysis corpus (one slice in `build_activation_cache`) was enough to surface the features above.
 

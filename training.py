@@ -156,7 +156,7 @@ def train_sae(
     sae.train()
 
     optimizer = AdamW(sae.parameters(), lr=sae.config.lr, weight_decay=0.0)
-    
+
     # Guard a silent failure: the original warmup_steps=1000 vs ~976-step run
     expected_steps = max(1, n_training_tokens // BATCH_SIZE)
     warmup_steps = sae.config.warmup_steps
@@ -194,6 +194,8 @@ def train_sae(
         f"{warmup_steps}-step warmup"
     )
     print(f"  Target tokens : {n_training_tokens:,}")
+    print(f"  Input scaling : handled inside the SAE "
+          f"(normalize_input={sae.config.normalize_input})")
     print()
 
     src_iter = iter(activation_source)
@@ -245,13 +247,9 @@ def train_sae(
             if buffer.shape[0] - buffer_offset < BATCH_SIZE:
                 break
 
+        # Raw residuals: the SAE normalizes internally (SAEConfig.normalize_input).
         batch = buffer[buffer_offset : buffer_offset + BATCH_SIZE].to(device)
         buffer_offset += BATCH_SIZE
-        # normalize to norm sqrt(d_model): raw layer-8 residuals (norm ~150) make the
-        batch = (
-            batch / batch.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            * (sae.config.d_model ** 0.5)
-        )
 
         output = sae(batch)
 

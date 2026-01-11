@@ -1,3 +1,5 @@
+import dataclasses
+
 import torch
 import pytest
 
@@ -27,7 +29,7 @@ def sae() -> SparseAutoencoder:
 
 @pytest.fixture(scope="class")
 def sae_no_l1() -> SparseAutoencoder:
-    """l1=0 so loss == recon. class-scoped: forward-pass tests don't mutate the model."""
+    """l1=0 so loss == recon. class-scoped: forward-pass tests don't  mutate the model"""
     config = SAEConfig(
         d_model=D_MODEL,
         n_features=N_FEATURES,
@@ -77,6 +79,54 @@ class TestForwardPass:
         assert out.per_token_recon_error.shape == (BATCH_SIZE,)
         assert not out.per_token_recon_error.requires_grad
         assert (out.per_token_recon_error >= 0).all().item()
+
+
+class TestInputNormalization:
+    """The SAE owns its input contract: encode/forward normalize to sqrt(d_model),
+    so raw and pre-normalized inputs give identical features."""
+    def test_encode_scale_invariant(self, sae):
+        """the historical bug, inverted: output must not depend on input scale (raw
+        ~150-norm inputs vs the same inputs pre-scaled)."""
+        x = torch.randn(BATCH_SIZE, D_MODEL)
+        h_raw = sae.encode(x)
+        h_scaled = sae.encode(150.0 * x)
+        assert torch.allclose(h_raw, h_scaled, atol=1e-5)
+
+    def test_encode_matches_manual_normalization(self, sae):
+        """encode(raw) with the flag on == encode(manually normalized) with the flag
+        off, same weights."""
+        cfg_off = dataclasses.replace(sae.config, normalize_input=False)
+        sae_off = SparseAutoencoder(cfg_off)
+        sae_off.load_state_dict(sae.state_dict())
+
+        x = torch.randn(BATCH_SIZE, D_MODEL) * 150.0
+        manual = (
+            x / x.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            * (D_MODEL ** 0.5)
+        )
+        assert torch.allclose(sae.encode(x), sae_off.encode(manual), atol=1e-5)
+
+    def test_preprocess_idempotent(self, sae):
+        x = torch.randn(BATCH_SIZE, D_MODEL) * 150.0
+        once = sae.preprocess(x)
+        twice = sae.preprocess(once)
+        assert torch.allclose(once, twice, atol=1e-6)
+
+    def test_preprocess_target_norm(self, sae):
+        x = torch.randn(BATCH_SIZE, D_MODEL) * 37.0
+        norms = sae.preprocess(x).norm(dim=-1)
+        expected = torch.full((BATCH_SIZE,), D_MODEL ** 0.5)
+        assert torch.allclose(norms, expected, atol=1e-4)
+
+    def test_flag_off_is_identity(self):
+        cfg = SAEConfig(
+            d_model=D_MODEL,
+            n_features=N_FEATURES,
+            normalize_input=False,
+        )
+        sae = SparseAutoencoder(cfg)
+        x = torch.randn(BATCH_SIZE, D_MODEL) * 150.0
+        assert torch.equal(sae.preprocess(x), x)
 
 
 class TestInit:
@@ -175,6 +225,20 @@ class TestResampleDeadFeatures:
         )
 
         assert (sae.feature_activation_counts == 0).all().item()
+
+    def test_resampled_decoder_rows_unit_norm_from_raw_inputs(self, sae):
+        """resample_dead_features preprocesses internally, so raw-scale activations
+        still yield unit-norm rows in the normalized space W_dec lives in."""
+        sae.feature_activation_counts.zero_()
+        sae.feature_activation_counts[:10] = 5
+        dead = sae.get_dead_features(threshold=0)
+
+        raw_activations = torch.randn(BATCH_SIZE, D_MODEL) * 150.0
+        errors = torch.rand(BATCH_SIZE)
+        sae.resample_dead_features(dead, raw_activations, errors)
+
+        norms = sae.W_dec.data[dead].norm(dim=1)
+        assert torch.allclose(norms, torch.ones(len(dead)), atol=1e-5)
 
     def test_resample_zeros_optimizer_state(self, sae):
         """resampled slices must zero adam moments. otherwise stale momentum drags

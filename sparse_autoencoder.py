@@ -15,6 +15,9 @@ class SAEConfig:
     lr: float = 2e-4
     warmup_steps: int = 100
     normalize_decoder: bool = True
+    # The SAE owns its input contract: inputs scaled to norm sqrt(d_model) inside
+    # encode/forward, so training, analysis, and eval cannot diverge.
+    normalize_input: bool = True
 
     @property
     def expansion_factor(self) -> float:
@@ -52,6 +55,16 @@ class SparseAutoencoder(nn.Module):
             torch.zeros(f, dtype=torch.long),
         )
 
+    # Input contract
+    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        """Scale inputs to norm sqrt(d_model)."""
+        if not self.config.normalize_input:
+            return x
+        return (
+            x / x.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            * (self.config.d_model ** 0.5)
+        )
+
     # Decoder constraint
     def normalize_decoder(self) -> None:
         with torch.no_grad():
@@ -68,24 +81,21 @@ class SparseAutoencoder(nn.Module):
             inner = (grad * W).sum(dim=1, keepdim=True)
             grad.sub_((inner / norms_sq) * W)
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
+    # Forward paths
+    def _encode_preprocessed(self, x: torch.Tensor) -> torch.Tensor:
         x_centered = x - self.b_dec
         pre_activations = x_centered @ self.W_enc + self.b_enc
         return F.relu(pre_activations)
 
-    def encode_raw(self, x: torch.Tensor) -> torch.Tensor:
-        """Convenience: normalize raw residuals to norm sqrt(d_model), then encode."""
-        x = (
-            x / x.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            * (self.config.d_model ** 0.5)
-        )
-        return self.encode(x)
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self._encode_preprocessed(self.preprocess(x))
 
     def decode(self, h: torch.Tensor) -> torch.Tensor:
         return h @ self.W_dec + self.b_dec
 
     def forward(self, x: torch.Tensor) -> SAEOutput:
-        h = self.encode(x)
+        x = self.preprocess(x)
+        h = self._encode_preprocessed(x)
         x_reconstructed = self.decode(h)
 
         reconstruction_loss = F.mse_loss(x_reconstructed, x)
@@ -130,6 +140,7 @@ class SparseAutoencoder(nn.Module):
         if len(dead_feature_indices) == 0:
             return
 
+        activations = self.preprocess(activations)
         n_dead = len(dead_feature_indices)
 
         error_weights = errors / errors.sum().clamp(min=1e-8)
