@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from dataclasses import asdict
 
 import numpy as np
 import torch
@@ -134,10 +135,11 @@ def main() -> None:
     )
 
     checkpoint_path = "sae_gpt2_layer8.pt"
+    # plain-dict config: loads under torch.load's safe weights_only=True.
     torch.save(
         {
             "sae_state_dict": sae.state_dict(),
-            "config": config,
+            "config": asdict(config),
             "layer": TARGET_LAYER,
             "training_history": history,
         },
@@ -162,7 +164,14 @@ def main() -> None:
     print("Building feature cache (one SAE encode pass per text)...")
     feat_cache = build_feature_cache(sae, act_cache, device=device)
 
-    interesting = find_interesting_features(feat_cache, sae)
+    interesting = find_interesting_features(
+        feat_cache,
+        n_features=config.n_features,
+    )
+    print(
+        f"\nFound {len(interesting)} candidate features "
+        f"(activation rate 0.1%-20%, mean activation when active > 0.5)"
+    )
 
     n_to_show = min(5, len(interesting))
     print(f"\nAnalyzing {n_to_show} interesting features:")

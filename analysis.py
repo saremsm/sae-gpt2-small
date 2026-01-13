@@ -185,6 +185,7 @@ def feature_token_projection(
     feature_idx: int,
     top_k: int = 20,
 ) -> TokenProjection:
+    """Feature direction through the unembedding: W_dec[i] @ W_U, no ln_final."""
     feature_direction = sae.W_dec[feature_idx]
 
     with torch.no_grad():

@@ -10,8 +10,8 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 model = HookedTransformer.from_pretrained("gpt2").to(device)
 
-ckpt = torch.load("sae_gpt2_layer8.pt", map_location=device, weights_only=False)
-cfg = ckpt["config"]
+ckpt = torch.load("sae_gpt2_layer8.pt", map_location=device, weights_only=True)
+cfg = SAEConfig(**ckpt["config"])
 sae = SparseAutoencoder(cfg).to(device)
 sae.load_state_dict(ckpt["sae_state_dict"])
 sae.eval()

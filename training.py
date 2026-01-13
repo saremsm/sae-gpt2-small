@@ -47,6 +47,7 @@ class InlineActivationSource:
         self.device = device
         self.max_batches = max_batches
         self._hook_name = f"blocks.{layer}.hook_resid_post"
+        self._epoch = 0
 
         tokenizer = model.tokenizer
         bos = tokenizer.bos_token_id
@@ -85,6 +86,10 @@ class InlineActivationSource:
         dataset = load_dataset(
             self.dataset_name, split="train", trust_remote_code=True
         )
+        if self._epoch > 0:
+            # Re-shuffle on repeat passes: epoch 2 must not replay epoch 1 byte-
+            dataset = dataset.shuffle(seed=self._epoch)
+        self._epoch += 1
         self.model.eval()
 
         batch_count = 0

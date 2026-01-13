@@ -6,6 +6,7 @@ import pytest
 from sparse_autoencoder import SparseAutoencoder, SAEConfig
 from analysis import (
     FeatureCache,
+    find_interesting_features,
     find_max_activating_examples,
 )
 
@@ -29,7 +30,8 @@ def sae() -> SparseAutoencoder:
 
 @pytest.fixture(scope="class")
 def sae_no_l1() -> SparseAutoencoder:
-    """l1=0 so loss == recon. class-scoped: forward-pass tests don't  mutate the model"""
+    """l1=0 so loss == recon. class-scoped and in eval mode: forward in train mode
+    mutates feature_activation_counts."""
     config = SAEConfig(
         d_model=D_MODEL,
         n_features=N_FEATURES,
@@ -38,7 +40,9 @@ def sae_no_l1() -> SparseAutoencoder:
         warmup_steps=10,
         normalize_decoder=True,
     )
-    return SparseAutoencoder(config)
+    sae = SparseAutoencoder(config)
+    sae.eval()
+    return sae
 
 
 class TestForwardPass:
@@ -71,6 +75,11 @@ class TestForwardPass:
         x = torch.randn(BATCH_SIZE, D_MODEL)
         out = sae_no_l1(x)
         assert out.l0.isfinite().item() and out.l0.item() >= 0
+
+    def test_counts_not_mutated_in_eval_mode(self, sae_no_l1):
+        before = sae_no_l1.feature_activation_counts.clone()
+        sae_no_l1(torch.randn(BATCH_SIZE, D_MODEL))
+        assert torch.equal(sae_no_l1.feature_activation_counts, before)
 
     def test_per_token_recon_error_shape_and_grad(self, sae_no_l1):
         """per_token_recon_error must be per-token (B,) and detached."""
@@ -341,3 +350,46 @@ class TestFindMaxActivatingExamples:
             f"expected 'X' (first token of text 1), "
             f"got '{results[0]['peak_token']}'"
         )
+
+
+class TestFindInterestingFeatures:
+    @pytest.fixture
+    def two_feature_cache(self) -> FeatureCache:
+        """feature 0: rate 10%, mean-when-active 2.0 (in-band, strong); feature 1:
+        rate 50%, mean-when-active 0.1 (doubly out-of-band)."""
+        n_tokens = 100
+        fa = torch.zeros(n_tokens, 2)
+        fa[:10, 0] = 2.0
+        fa[:50, 1] = 0.1
+        return FeatureCache(
+            feature_acts=fa,
+            text_offsets=torch.tensor([0, n_tokens], dtype=torch.long),
+            token_strings=[["tok"] * n_tokens],
+            texts=["tok " * n_tokens],
+        )
+
+    def test_in_band_feature_selected(self, two_feature_cache):
+        result = find_interesting_features(two_feature_cache, n_features=2)
+        assert 0 in result
+
+    def test_out_of_band_feature_rejected(self, two_feature_cache):
+        result = find_interesting_features(two_feature_cache, n_features=2)
+        assert 1 not in result
+
+    def test_chunked_reduce_matches_full_reduce(self, two_feature_cache):
+        small = find_interesting_features(
+            two_feature_cache, n_features=2, chunk_size=3
+        )
+        full = find_interesting_features(
+            two_feature_cache, n_features=2, chunk_size=1000
+        )
+        assert small == full
+
+    def test_shape_mismatch_raises(self, two_feature_cache):
+        with pytest.raises(ValueError):
+            find_interesting_features(two_feature_cache, n_features=7)
+
+    def test_returns_data_not_prints(self, two_feature_cache, capsys):
+        """design principle, executable: queries return data, never print."""
+        find_interesting_features(two_feature_cache, n_features=2)
+        assert capsys.readouterr().out == ""
