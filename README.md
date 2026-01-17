@@ -25,7 +25,7 @@ One critical inconsistency and several config-level bugs, caught after the first
 
 ## numbers
 
-Measured on a Lambda A10 (24 GB): ~32s wall-clock for 500K tokens, plus ~30s for analysis on 100 texts.
+**These are the earlier numbers** - measured before the review changes above, on a Lambda A10 (24 GB): ~32s wall-clock for 500K tokens, plus ~30s for analysis on 100 texts. They need a re-run: the warmup fix (item 2) should improve MSE/L0/VE at identical budget, and the normalization fix (item 1) changes the scale on which the analysis-side statistics were computed. Kept for honesty about where the project stood at review time; superseded by the numbers above.
 
 | | |
 |---|---|
@@ -35,7 +35,7 @@ Measured on a Lambda A10 (24 GB): ~32s wall-clock for 500K tokens, plus ~30s for
 | dead features at end | 0 / 3072 (but see review item 3 - the window was broken) |
 | variance explained | 55% (pre-FVU metric; see review item 5) |
 
-Three features that came out interpretable enough to describe in a sentence:
+Three features that came out interpretable enough to describe in a sentence - **identified under the mis-scaled analysis path (review item 1), so treat as promising leads to re-verify after retraining**, not confirmed results:
 
 - **feature 679** - sentence-boundary / discourse-connective detector. Fires on `.` followed by newline; the decoder row's logit-lens projection top-promotes *However*, *Furthermore*, *Moreover*, *Additionally*, *Therefore*. Reads as "end of sentence, next sentence will continue or contrast the argument."
 - **feature 2107** - Q&A-format detector. Fires on the newline immediately after `Q:\n`. Logit lens promotes *What*, *How*, *Why*, *Hello*, *Answer*. The SAE has learned that this exact pattern precedes a question.
@@ -68,3 +68,5 @@ Layer 8 is a guess from probing literature on GPT-2-small. A real choice would g
 Single-process: model forward, SAE forward, and optimizer step run sequentially. The `ActivationSource` protocol is shaped so a producer/consumer split is contained - the trainer doesn't have to know whether the source is in-process or behind a socket.
 
 In-memory feature cache. `(total_tokens, n_features)` in RAM is fine for 100 texts. The layout (flat token array plus per-text offsets) maps cleanly onto Parquet sharded by feature index when this becomes the bottleneck.
+
+Pre-fix headline numbers and the three feature write-ups have not yet been regenerated on the fixed code (see the numbers section); re-running `main.py` and `variance_explained.py` is the outstanding task.
