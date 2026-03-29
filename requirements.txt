@@ -3,5 +3,14 @@ transformer_lens>=1.14.0
 datasets>=2.14.0
 tqdm>=4.65.0
 matplotlib>=3.7.0
-numpy>=1.24.0
+numpy>=1.24.0,<2
 pytest>=7.0.0
+
+# Transitive deps that must come from the venv, not Ubuntu's apt packages.
+# Lambda images expose system scipy/pandas/sklearn/pillow built against
+# NumPy 1.x and an old PIL; venv-native builds avoid the ABI mismatch.
+scipy>=1.11
+pandas>=2.0
+scikit-learn>=1.3
+networkx>=3.0
+pillow>=9.1

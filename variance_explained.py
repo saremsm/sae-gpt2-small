@@ -13,7 +13,7 @@ model = HookedTransformer.from_pretrained("gpt2").to(device)
 ckpt = torch.load("sae_gpt2_layer8.pt", map_location=device, weights_only=True)
 cfg = SAEConfig(**ckpt["config"])
 sae = SparseAutoencoder(cfg).to(device)
-sae.load_state_dict(ckpt["sae_state_dict"])
+sae.load_state_dict(ckpt["sae_state_dict"])  # includes input_scale
 sae.eval()
 
 src = InlineActivationSource(
@@ -24,19 +24,19 @@ src = InlineActivationSource(
 chunks = []
 for chunk in src:
     chunks.append(chunk)
-acts = torch.cat(chunks, dim=0).to(device)
+acts = torch.cat(chunks, dim=0).to(device)  # raw residuals
 
 with torch.no_grad():
-    out = sae(acts)                # normalizes internally
-    x = sae.preprocess(acts)       # the target lives in normalized space
+    out = sae(acts)  # scales internally; recon_raw is back in raw space
 
-    resid_ss = (x - out.reconstructed).pow(2).sum()
-    total_ss = (x - x.mean(dim=0, keepdim=True)).pow(2).sum()
+    resid_ss = (acts - out.recon_raw).pow(2).sum()
+    total_ss = (acts - acts.mean(dim=0, keepdim=True)).pow(2).sum()
     fvu = (resid_ss / total_ss).item()
     ve = 1.0 - fvu
 
 print(f"Tokens evaluated     : {acts.shape[0]}")
-print(f"Reconstruction MSE   : {out.reconstruction_loss.item():.4f}")
+print(f"input_scale          : {sae.input_scale.item():.5f}")
+print(f"Reconstruction MSE   : {out.reconstruction_loss.item():.4f}  (scaled space)")
 print(f"L0 (avg active feats): {out.l0.item():.1f}")
-print(f"FVU                  : {fvu:.3f}")
+print(f"FVU                  : {fvu:.3f}  (raw space; scale-invariant)")
 print(f"Variance explained   : {ve:.3f}  ({ve*100:.1f}%)  [1 - FVU]")

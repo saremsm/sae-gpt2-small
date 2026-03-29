@@ -55,13 +55,9 @@ def main() -> None:
 
     optimizer = AdamW(sae.parameters(), lr=2e-4, weight_decay=0.0)
 
-    # synthetic activations pre-scaled to sqrt(d_model)
-    x_raw = torch.randn(BATCH_SIZE, D_MODEL, device=device) * 6.0
-    x = (
-        x_raw
-        / x_raw.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        * (D_MODEL ** 0.5)
-    )
+    # raw synthetic activations at roughly layer-8 scale (norm ~166)
+    x = torch.randn(BATCH_SIZE, D_MODEL, device=device) * 6.0
+    sae.set_input_scale_from_activations(x)
 
     # warmup: cudnn autotune, allocator caching, lazy init
     print(f"\nWarmup: {WARMUP_STEPS} steps...")

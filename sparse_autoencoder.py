@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import math
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,8 +18,7 @@ class SAEConfig:
     lr: float = 2e-4
     warmup_steps: int = 100
     normalize_decoder: bool = True
-    # The SAE owns its input contract: inputs scaled to norm sqrt(d_model) inside
-    # encode/forward, so training, analysis, and eval cannot diverge.
+    # The SAE owns its input contract: raw residuals are multiplied by one.
     normalize_input: bool = True
 
     @property
@@ -25,13 +27,18 @@ class SAEConfig:
 
 
 class SAEOutput(NamedTuple):
-    reconstructed: torch.Tensor
-    features: torch.Tensor
+    # Reconstruction in scaled space (x * input_scale)
+    recon_scaled: torch.Tensor
+    # postprocess(recon_scaled): raw residual space, spliceable back into the
+    recon_raw: torch.Tensor
+    # Feature activations (post-ReLU).
+    h: torch.Tensor
     loss: torch.Tensor
+    # MSE in scaled space.
     reconstruction_loss: torch.Tensor
     sparsity_loss: torch.Tensor
     l0: torch.Tensor
-    # Per-token reconstruction error (detached) - resampling weights.
+    # Per-token reconstruction error (scaled space, detached) - resampling
     per_token_recon_error: torch.Tensor
 
 
@@ -54,16 +61,46 @@ class SparseAutoencoder(nn.Module):
             "feature_activation_counts",
             torch.zeros(f, dtype=torch.long),
         )
+        # Dataset-wide input scale (scalar).
+        self.register_buffer(
+            "input_scale",
+            torch.ones((), dtype=torch.float32),
+        )
 
     # Input contract
+    def set_input_scale(self, value: float) -> None:
+        """Set input_scale directly (e.g. to a previously calibrated value)."""
+        value = float(value)
+        if not (value > 0.0 and math.isfinite(value)):
+            raise ValueError(
+                f"input_scale must be positive and finite, got {value}"
+            )
+        with torch.no_grad():
+            self.input_scale.fill_(value)
+
+    def set_input_scale_from_activations(self, x: torch.Tensor) -> None:
+        """Calibrate input_scale = sqrt(d_model) / mean_i ||x_i||_2 on a sample of
+        raw activations, shape (n, d_model)."""
+        with torch.no_grad():
+            mean_norm = x.detach().float().norm(dim=-1).mean().item()
+        if not (mean_norm > 0.0 and math.isfinite(mean_norm)):
+            raise ValueError(
+                f"cannot calibrate input_scale: mean activation norm is "
+                f"{mean_norm}"
+            )
+        self.set_input_scale((self.config.d_model ** 0.5) / mean_norm)
+
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
-        """Scale inputs to norm sqrt(d_model)."""
+        """Raw -> scaled space: x * input_scale."""
         if not self.config.normalize_input:
             return x
-        return (
-            x / x.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            * (self.config.d_model ** 0.5)
-        )
+        return x * self.input_scale
+
+    def postprocess(self, x_hat_scaled: torch.Tensor) -> torch.Tensor:
+        """Scaled -> raw space: x_hat_scaled / input_scale."""
+        if not self.config.normalize_input:
+            return x_hat_scaled
+        return x_hat_scaled / self.input_scale
 
     # Decoder constraint
     def normalize_decoder(self) -> None:
@@ -87,24 +124,27 @@ class SparseAutoencoder(nn.Module):
         pre_activations = x_centered @ self.W_enc + self.b_enc
         return F.relu(pre_activations)
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return self._encode_preprocessed(self.preprocess(x))
+    def encode(self, x_raw: torch.Tensor) -> torch.Tensor:
+        """Feature activations for RAW residuals."""
+        return self._encode_preprocessed(self.preprocess(x_raw))
 
     def decode(self, h: torch.Tensor) -> torch.Tensor:
+        """Reconstruction in SCALED space; postprocess for raw space."""
         return h @ self.W_dec + self.b_dec
 
-    def forward(self, x: torch.Tensor) -> SAEOutput:
-        x = self.preprocess(x)
+    def forward(self, x_raw: torch.Tensor) -> SAEOutput:
+        """raw residuals in; loss/MSE in scaled space, recon_raw mapped back to raw."""
+        x = self.preprocess(x_raw)
         h = self._encode_preprocessed(x)
-        x_reconstructed = self.decode(h)
+        recon_scaled = self.decode(h)
 
-        reconstruction_loss = F.mse_loss(x_reconstructed, x)
+        reconstruction_loss = F.mse_loss(recon_scaled, x)
         sparsity_loss = h.abs().sum(dim=-1).mean()
         loss = reconstruction_loss + self.config.l1_coefficient * sparsity_loss
 
         l0 = (h > 0).float().sum(dim=-1).mean()
         per_token_recon_error = (
-            (x_reconstructed - x).pow(2).mean(dim=-1).detach()
+            (recon_scaled - x).pow(2).mean(dim=-1).detach()
         )
 
         if self.training:
@@ -112,14 +152,51 @@ class SparseAutoencoder(nn.Module):
                 self.feature_activation_counts += (h > 0).long().sum(dim=0)
 
         return SAEOutput(
-            reconstructed=x_reconstructed,
-            features=h,
+            recon_scaled=recon_scaled,
+            recon_raw=self.postprocess(recon_scaled),
+            h=h,
             loss=loss,
             reconstruction_loss=reconstruction_loss,
             sparsity_loss=sparsity_loss,
             l0=l0,
             per_token_recon_error=per_token_recon_error,
         )
+
+    # Checkpoint compatibility
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        """A state_dict without `input_scale` (written before the scalar input scale
+        existed) loads with input_scale = 1.0 and a warning instead of a missing-
+        key error."""
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        key = prefix + "input_scale"
+        if key in missing_keys:
+            missing_keys.remove(key)
+            warnings.warn(
+                f"state_dict has no '{key}' (checkpoint predates the "
+                f"dataset-wide input scale); defaulting input_scale to 1.0. "
+                f"Recalibrate with set_input_scale_from_activations, or "
+                f"set_input_scale, if the model was trained on scaled inputs.",
+                stacklevel=2,
+            )
+            with torch.no_grad():
+                self.input_scale.fill_(1.0)
 
     # Dead-feature handling
 

@@ -83,9 +83,8 @@ class InlineActivationSource:
         return tokens, attn_mask
 
     def __iter__(self) -> Iterator[torch.Tensor]:
-        dataset = load_dataset(
-            self.dataset_name, split="train", trust_remote_code=True
-        )
+        # no trust_remote_code: datasets>=3 ignores it and prints a warning on every.
+        dataset = load_dataset(self.dataset_name, split="train")
         if self._epoch > 0:
             # Re-shuffle on repeat passes: epoch 2 must not replay epoch 1 byte-
             dataset = dataset.shuffle(seed=self._epoch)
@@ -153,7 +152,9 @@ def train_sae(
     log_interval: int = 100,
     device: str = "cpu",
     seed: int = 42,
+    calibration_tokens: int = 100_000,
 ) -> TrainingHistory:
+    """Train `sae` on raw residuals from `activation_source`."""
     torch.manual_seed(seed)
     if device == "cuda":
         torch.cuda.manual_seed_all(seed)
@@ -188,26 +189,11 @@ def train_sae(
         "act_norm": [],
     }
 
-    print("=" * 60)
-    print("Training SAE")
-    print(
-        f"  Features      : {sae.config.n_features} "
-        f"(d_model={sae.config.d_model})"
-    )
-    print(
-        f"  LR schedule   : {sae.config.lr} with "
-        f"{warmup_steps}-step warmup"
-    )
-    print(f"  Target tokens : {n_training_tokens:,}")
-    print(f"  Input scaling : handled inside the SAE "
-          f"(normalize_input={sae.config.normalize_input})")
-    print()
-
     src_iter = iter(activation_source)
     buffer = torch.empty(0, sae.config.d_model)
     buffer_offset = 0
 
-    def refill_buffer() -> None:
+    def refill_buffer(target_tokens: int = BUFFER_TARGET_TOKENS) -> None:
         nonlocal buffer, buffer_offset, src_iter
 
         chunks: list[torch.Tensor] = []
@@ -217,7 +203,7 @@ def train_sae(
 
         total = sum(c.shape[0] for c in chunks)
         restarts = 0
-        while total < BUFFER_TARGET_TOKENS:
+        while total < target_tokens:
             try:
                 chunk = next(src_iter)
             except StopIteration:
@@ -237,6 +223,52 @@ def train_sae(
         perm = torch.randperm(flat.shape[0])
         buffer = flat[perm].contiguous()
 
+    # Calibrate the SAE's dataset-wide input scale (sqrt(d) / mean ||x||)
+    n_calib = 0
+    if calibration_tokens > 0:
+        print(
+            f"Calibrating input_scale on >= {calibration_tokens:,} raw "
+            f"tokens..."
+        )
+        refill_buffer(max(BUFFER_TARGET_TOKENS, calibration_tokens))
+        n_calib = buffer.shape[0]
+        if n_calib == 0:
+            print(
+                "WARNING: activation source yielded no tokens; input_scale "
+                f"left at {sae.input_scale.item():.4g}."
+            )
+        else:
+            if n_calib < calibration_tokens:
+                print(
+                    f"WARNING: only {n_calib:,} tokens available for "
+                    f"input_scale calibration (wanted {calibration_tokens:,}); "
+                    f"the source is exhausted, calibrating on what there is."
+                )
+            sae.set_input_scale_from_activations(buffer)
+
+    print("=" * 60)
+    print("Training SAE")
+    print(
+        f"  Features      : {sae.config.n_features} "
+        f"(d_model={sae.config.d_model})"
+    )
+    print(
+        f"  LR schedule   : {sae.config.lr} with "
+        f"{warmup_steps}-step warmup"
+    )
+    print(f"  Target tokens : {n_training_tokens:,}")
+    calib_note = (
+        f"calibrated on {n_calib:,} tokens" if n_calib
+        else "not calibrated in this call"
+    )
+    print(
+        f"  Input scaling : x * input_scale inside the SAE, "
+        f"input_scale={sae.input_scale.item():.4g} "
+        f"({calib_note}; normalize_input={sae.config.normalize_input})"
+    )
+    print("  Loss / MSE    : reported in scaled space")
+    print()
+
     # Rolling resampling pool: raw activations + their per-token errors from
     resample_pool: deque[tuple[torch.Tensor, torch.Tensor]] = deque(
         maxlen=RESAMPLE_POOL_BATCHES
@@ -252,7 +284,7 @@ def train_sae(
             if buffer.shape[0] - buffer_offset < BATCH_SIZE:
                 break
 
-        # Raw residuals: the SAE normalizes internally (SAEConfig.normalize_input).
+        # Raw residuals: the SAE applies input_scale internally.
         batch = buffer[buffer_offset : buffer_offset + BATCH_SIZE].to(device)
         buffer_offset += BATCH_SIZE
 
@@ -327,7 +359,11 @@ def train_sae(
     pbar.close()
     if history["loss"]:
         print("\nTraining complete.")
-        print(f"  Final loss        : {history['loss'][-1]:.4f}")
+        print(f"  Final loss        : {history['loss'][-1]:.4f} (scaled space)")
+        print(
+            f"  Final recon MSE   : {history['reconstruction_loss'][-1]:.4f} "
+            f"(scaled space)"
+        )
         print(f"  Final L0          : {history['l0'][-1]:.1f}")
         print(
             f"  Dead features     : {history['dead_features'][-1]} / "

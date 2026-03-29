@@ -6,6 +6,7 @@ import pytest
 from sparse_autoencoder import SparseAutoencoder, SAEConfig
 from analysis import (
     FeatureCache,
+    feature_activation_stats,
     find_interesting_features,
     find_max_activating_examples,
 )
@@ -46,15 +47,24 @@ def sae_no_l1() -> SparseAutoencoder:
 
 
 class TestForwardPass:
-    def test_reconstructed_shape(self, sae_no_l1):
+    def test_recon_scaled_shape(self, sae_no_l1):
         x = torch.randn(BATCH_SIZE, D_MODEL)
         out = sae_no_l1(x)
-        assert out.reconstructed.shape == (BATCH_SIZE, D_MODEL)
+        assert out.recon_scaled.shape == (BATCH_SIZE, D_MODEL)
 
-    def test_features_shape(self, sae_no_l1):
+    def test_recon_raw_shape_and_is_postprocessed(self, sae_no_l1):
+        """recon_raw is postprocess(recon_scaled): same shape, raw space."""
         x = torch.randn(BATCH_SIZE, D_MODEL)
         out = sae_no_l1(x)
-        assert out.features.shape == (BATCH_SIZE, N_FEATURES)
+        assert out.recon_raw.shape == (BATCH_SIZE, D_MODEL)
+        assert torch.allclose(
+            out.recon_raw, sae_no_l1.postprocess(out.recon_scaled)
+        )
+
+    def test_h_shape(self, sae_no_l1):
+        x = torch.randn(BATCH_SIZE, D_MODEL)
+        out = sae_no_l1(x)
+        assert out.h.shape == (BATCH_SIZE, N_FEATURES)
 
     def test_loss_is_scalar(self, sae_no_l1):
         x = torch.randn(BATCH_SIZE, D_MODEL)
@@ -66,10 +76,10 @@ class TestForwardPass:
         out = sae_no_l1(x)
         assert out.loss.isfinite().item()
 
-    def test_features_non_negative(self, sae_no_l1):
+    def test_h_non_negative(self, sae_no_l1):
         x = torch.randn(BATCH_SIZE, D_MODEL)
         out = sae_no_l1(x)
-        assert (out.features >= 0).all().item()
+        assert (out.h >= 0).all().item()
 
     def test_l0_finite_and_non_negative(self, sae_no_l1):
         x = torch.randn(BATCH_SIZE, D_MODEL)
@@ -91,51 +101,116 @@ class TestForwardPass:
 
 
 class TestInputNormalization:
-    """The SAE owns its input contract: encode/forward normalize to sqrt(d_model),
-    so raw and pre-normalized inputs give identical features."""
-    def test_encode_scale_invariant(self, sae):
-        """the historical bug, inverted: output must not depend on input scale (raw
-        ~150-norm inputs vs the same inputs pre-scaled)."""
-        x = torch.randn(BATCH_SIZE, D_MODEL)
-        h_raw = sae.encode(x)
-        h_scaled = sae.encode(150.0 * x)
-        assert torch.allclose(h_raw, h_scaled, atol=1e-5)
+    """The SAE owns its input contract: encode/forward multiply raw inputs by ONE."""
+    def test_default_scale_is_one_and_identity(self, sae):
+        assert sae.input_scale.item() == 1.0
+        assert sae.input_scale.dtype == torch.float32
+        x = torch.randn(BATCH_SIZE, D_MODEL) * 150.0
+        assert torch.equal(sae.preprocess(x), x)
 
-    def test_encode_matches_manual_normalization(self, sae):
-        """encode(raw) with the flag on == encode(manually normalized) with the flag
-        off, same weights."""
+    def test_calibrated_mean_norm_is_sqrt_d(self, sae):
+        """set_input_scale_from_activations: mean ||preprocess(x)|| == sqrt(d) to
+        1e-4 relative on the calibration sample itself."""
+        x = torch.randn(1000, D_MODEL) * 37.0
+        sae.set_input_scale_from_activations(x)
+        mean_norm = sae.preprocess(x).norm(dim=-1).mean().item()
+        target = D_MODEL ** 0.5
+        assert abs(mean_norm - target) / target < 1e-4
+
+    def test_preprocess_is_linear_not_per_token(self, sae):
+        """preprocess(2x) == 2 preprocess(x), and two tokens with different norms
+        keep their norm ratio - no per-token equalisation."""
+        sae.set_input_scale(0.37)
+        x = torch.randn(BATCH_SIZE, D_MODEL)
+        assert torch.allclose(sae.preprocess(2.0 * x), 2.0 * sae.preprocess(x))
+
+        a = torch.randn(1, D_MODEL) * 10.0
+        b = torch.randn(1, D_MODEL) * 150.0
+        ratio_raw = (a.norm() / b.norm()).item()
+        ratio_scaled = (
+            sae.preprocess(a).norm() / sae.preprocess(b).norm()
+        ).item()
+        assert abs(ratio_raw - ratio_scaled) <= 1e-5 * ratio_raw
+
+    def test_postprocess_inverts_preprocess(self, sae):
+        sae.set_input_scale_from_activations(torch.randn(256, D_MODEL) * 150.0)
+        x = torch.randn(BATCH_SIZE, D_MODEL) * 150.0
+        # atol=1e-6 plus default rtol: float32 x*s/s round-trips to ~1 ulp
+        assert torch.allclose(sae.postprocess(sae.preprocess(x)), x, atol=1e-6)
+
+    def test_encode_applies_input_scale(self, sae):
+        """encode(raw) with the flag on and scale s == encode(raw * s) with the flag
+        off."""
+        sae.set_input_scale_from_activations(torch.randn(256, D_MODEL) * 150.0)
         cfg_off = dataclasses.replace(sae.config, normalize_input=False)
         sae_off = SparseAutoencoder(cfg_off)
         sae_off.load_state_dict(sae.state_dict())
 
         x = torch.randn(BATCH_SIZE, D_MODEL) * 150.0
-        manual = (
-            x / x.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            * (D_MODEL ** 0.5)
+        assert torch.allclose(
+            sae.encode(x), sae_off.encode(x * sae.input_scale), atol=1e-5
         )
-        assert torch.allclose(sae.encode(x), sae_off.encode(manual), atol=1e-5)
-
-    def test_preprocess_idempotent(self, sae):
-        x = torch.randn(BATCH_SIZE, D_MODEL) * 150.0
-        once = sae.preprocess(x)
-        twice = sae.preprocess(once)
-        assert torch.allclose(once, twice, atol=1e-6)
-
-    def test_preprocess_target_norm(self, sae):
-        x = torch.randn(BATCH_SIZE, D_MODEL) * 37.0
-        norms = sae.preprocess(x).norm(dim=-1)
-        expected = torch.full((BATCH_SIZE,), D_MODEL ** 0.5)
-        assert torch.allclose(norms, expected, atol=1e-4)
 
     def test_flag_off_is_identity(self):
+        """normalize_input=False: preprocess/postprocess ignore input_scale
+        entirely."""
         cfg = SAEConfig(
             d_model=D_MODEL,
             n_features=N_FEATURES,
             normalize_input=False,
         )
         sae = SparseAutoencoder(cfg)
+        sae.set_input_scale(0.2)
         x = torch.randn(BATCH_SIZE, D_MODEL) * 150.0
         assert torch.equal(sae.preprocess(x), x)
+        assert torch.equal(sae.postprocess(x), x)
+
+    def test_set_input_scale_rejects_degenerate_values(self, sae):
+        with pytest.raises(ValueError):
+            sae.set_input_scale(0.0)
+        with pytest.raises(ValueError):
+            sae.set_input_scale(float("inf"))
+        with pytest.raises(ValueError):
+            sae.set_input_scale_from_activations(torch.zeros(4, D_MODEL))
+
+    def test_input_scale_survives_state_dict_round_trip(self, sae):
+        sae.set_input_scale(0.1234)
+        fresh = SparseAutoencoder(sae.config)
+        fresh.load_state_dict(sae.state_dict())
+        assert torch.equal(fresh.input_scale, sae.input_scale)
+
+    def test_missing_input_scale_defaults_to_one_with_warning(self, sae):
+        """a pre-input_scale checkpoint loads (strict=True) with a warning and
+        input_scale reset to 1.0 - reset, not merely left alone."""
+        legacy = {k: v for k, v in sae.state_dict().items() if k != "input_scale"}
+        fresh = SparseAutoencoder(sae.config)
+        fresh.set_input_scale(5.0)
+        with pytest.warns(UserWarning, match="input_scale"):
+            fresh.load_state_dict(legacy)
+        assert fresh.input_scale.item() == 1.0
+
+    def test_forward_recon_raw_matches_input(self):
+        """perfectly reconstructing SAE: W_dec = [I; -I], W_enc = W_dec.T, zero
+        biases, so decode(encode(x)) = relu(x) - relu(-x) = x. Then recon_raw ==
+        x_raw whatever input_scale is, and recon_scaled == preprocess(x_raw)."""
+        d = 8
+        cfg = SAEConfig(d_model=d, n_features=2 * d, l1_coefficient=0.0)
+        sae = SparseAutoencoder(cfg).eval()
+        with torch.no_grad():
+            eye = torch.eye(d)
+            sae.W_dec.copy_(torch.cat([eye, -eye], dim=0))
+            sae.W_enc.copy_(sae.W_dec.T)
+            sae.b_enc.zero_()
+            sae.b_dec.zero_()
+
+        x_raw = torch.randn(BATCH_SIZE, d) * 150.0
+        sae.set_input_scale_from_activations(x_raw)
+        assert sae.input_scale.item() != 1.0  # else the test proves nothing
+
+        out = sae(x_raw)
+        assert torch.allclose(out.recon_raw, x_raw, atol=1e-4)
+        assert torch.allclose(out.recon_scaled, sae.preprocess(x_raw), atol=1e-4)
+        assert out.reconstruction_loss.item() < 1e-8
 
 
 class TestInit:
@@ -237,7 +312,7 @@ class TestResampleDeadFeatures:
 
     def test_resampled_decoder_rows_unit_norm_from_raw_inputs(self, sae):
         """resample_dead_features preprocesses internally, so raw-scale activations
-        still yield unit-norm rows in the normalized space W_dec lives in."""
+        still yield unit-norm rows in the scaled space W_dec lives in."""
         sae.feature_activation_counts.zero_()
         sae.feature_activation_counts[:10] = 5
         dead = sae.get_dead_features(threshold=0)
@@ -393,3 +468,81 @@ class TestFindInterestingFeatures:
         """design principle, executable: queries return data, never print."""
         find_interesting_features(two_feature_cache, n_features=2)
         assert capsys.readouterr().out == ""
+
+    def test_activation_stats_values(self, two_feature_cache):
+        """rate and mean-when-active are what the fixture was built to have, and the
+        chunked reduction agrees with a single-chunk one."""
+        stats = feature_activation_stats(two_feature_cache, chunk_size=3)
+        assert torch.allclose(stats.rate, torch.tensor([0.1, 0.5]))
+        assert torch.allclose(stats.mean_when_active, torch.tensor([2.0, 0.1]))
+
+        full = feature_activation_stats(two_feature_cache, chunk_size=1000)
+        assert torch.allclose(stats.rate, full.rate)
+        assert torch.allclose(stats.mean_when_active, full.mean_when_active)
+
+    def test_ranked_by_mean_when_active_desc(self):
+        """three in-band features (rates 10%/5%/15%) with means 1.0/3.0/2.0 come
+        back strongest first: [1, 2, 0]; n_return truncates the head."""
+        n_tokens = 100
+        fa = torch.zeros(n_tokens, 3)
+        fa[:10, 0] = 1.0
+        fa[:5, 1] = 3.0
+        fa[:15, 2] = 2.0
+        cache = FeatureCache(
+            feature_acts=fa,
+            text_offsets=torch.tensor([0, n_tokens], dtype=torch.long),
+            token_strings=[["tok"] * n_tokens],
+            texts=["tok " * n_tokens],
+        )
+        assert find_interesting_features(cache, n_features=3) == [1, 2, 0]
+        assert find_interesting_features(cache, n_features=3, n_return=2) == [1, 2]
+
+
+class TestTrainSaeCalibration:
+    """train_sae calibrates input_scale on the first buffer fill."""
+
+    class _SyntheticSource:
+        """yields n_chunks of (chunk_tokens, d) raw activations."""
+        def __init__(self, d: int, chunk_tokens: int, n_chunks: int, scale: float):
+            self.d, self.chunk_tokens, self.n_chunks, self.scale = (
+                d, chunk_tokens, n_chunks, scale,
+            )
+
+        def __iter__(self):
+            g = torch.Generator().manual_seed(0)
+            for _ in range(self.n_chunks):
+                yield torch.randn(self.chunk_tokens, self.d, generator=g) * self.scale
+
+    def test_input_scale_calibrated_before_training(self):
+        from training import train_sae
+
+        d, scale = 16, 37.0
+        cfg = SAEConfig(d_model=d, n_features=32, l1_coefficient=1e-3, warmup_steps=2)
+        sae = SparseAutoencoder(cfg)
+        src = self._SyntheticSource(d=d, chunk_tokens=300, n_chunks=20, scale=scale)
+
+        history = train_sae(
+            sae, src, n_training_tokens=1024, resample_interval=1000,
+            log_interval=1, device="cpu", calibration_tokens=1000,
+        )
+
+        assert history["loss"], "training ran no steps"
+        assert sae.input_scale.item() != 1.0
+        # every chunk is iid, so scale * E||x|| == sqrt(d) up to sampling noise.
+        mean_norm = torch.cat(list(src)).norm(dim=-1).mean().item()
+        assert abs(sae.input_scale.item() * mean_norm - d ** 0.5) / d ** 0.5 < 0.02
+
+    def test_calibration_tokens_zero_leaves_scale_alone(self):
+        from training import train_sae
+
+        d = 16
+        cfg = SAEConfig(d_model=d, n_features=32, l1_coefficient=1e-3, warmup_steps=2)
+        sae = SparseAutoencoder(cfg)
+        sae.set_input_scale(0.25)
+        src = self._SyntheticSource(d=d, chunk_tokens=300, n_chunks=10, scale=37.0)
+
+        train_sae(
+            sae, src, n_training_tokens=512, resample_interval=1000,
+            log_interval=1, device="cpu", calibration_tokens=0,
+        )
+        assert sae.input_scale.item() == 0.25

@@ -23,6 +23,7 @@ from training import InlineActivationSource, train_sae
 from analysis import (
     build_activation_cache,
     build_feature_cache,
+    feature_activation_stats,
     find_interesting_features,
     analyze_feature,
 )
@@ -45,7 +46,7 @@ def plot_training_history(history: dict, save_path: str = "training_history.png"
     axes[0, 0].set_yscale("log")
 
     axes[0, 1].plot(steps, history["reconstruction_loss"])
-    axes[0, 1].set_title("Reconstruction loss (MSE, normalized space)")
+    axes[0, 1].set_title("Reconstruction loss (MSE, scaled space)")
     axes[0, 1].set_xlabel("Step")
     axes[0, 1].set_ylabel("MSE")
 
@@ -66,7 +67,7 @@ def plot_training_history(history: dict, save_path: str = "training_history.png"
         axes[1, 1].set_xlabel("Step")
         axes[1, 1].set_ylabel(r"$\|x\|_2$ mean (raw)")
         axes[1, 1].set_title(
-            "Raw input norm (SAE rescales to $\\sqrt{d}$ internally)",
+            "Raw input norm (SAE multiplies by input_scale internally)",
             fontsize=9,
         )
 
@@ -145,12 +146,15 @@ def main() -> None:
         },
         checkpoint_path,
     )
-    print(f"\nModel saved to '{checkpoint_path}'")
+    print(
+        f"\nModel saved to '{checkpoint_path}' "
+        f"(input_scale={sae.input_scale.item():.5f})"
+    )
 
     plot_training_history(history)
 
     print("\nLoading analysis texts...")
-    dataset = load_dataset("NeelNanda/pile-10k", split="train", trust_remote_code=True)
+    dataset = load_dataset("NeelNanda/pile-10k", split="train")
     analysis_texts = [
         item.get("text", "")
         for item in list(dataset)[:200]
@@ -168,10 +172,18 @@ def main() -> None:
         feat_cache,
         n_features=config.n_features,
     )
+    # find_interesting_features returns data only; the printing lives here.
+    stats = feature_activation_stats(feat_cache)
     print(
-        f"\nFound {len(interesting)} candidate features "
-        f"(activation rate 0.1%-20%, mean activation when active > 0.5)"
+        f"\nTop {len(interesting)} candidate features "
+        f"(activation rate 0.1%-20%, mean activation when active > 0.5):"
     )
+    for feature_idx in interesting:
+        print(
+            f"  feature {feature_idx:5d}: "
+            f"rate={stats.rate[feature_idx]:.4f}, "
+            f"mean act when active={stats.mean_when_active[feature_idx]:.3f}"
+        )
 
     n_to_show = min(5, len(interesting))
     print(f"\nAnalyzing {n_to_show} interesting features:")

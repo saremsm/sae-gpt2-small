@@ -29,6 +29,12 @@ class TokenProjection(NamedTuple):
     positive_tokens: list[tuple[str, float]]
     negative_tokens: list[tuple[str, float]]
 
+
+class FeatureActivationStats(NamedTuple):
+    """per-feature firing statistics over a FeatureCache, both (n_features,)"""
+    rate: Tensor  # fraction of tokens on which the feature is > 0
+    mean_when_active: Tensor  # mean activation over those tokens (0 if never)
+
 # activation cache
 
 @dataclass
@@ -104,7 +110,7 @@ def build_feature_cache(
         for start in range(0, seq_len, encode_batch_size):
             chunk = acts[start : start + encode_batch_size].to(device)
             with torch.no_grad():
-                # encode() applies the SAE's input normalization: raw residuals.
+                # encode() applies the SAE's input_scale: raw residuals.
                 text_features.append(sae.encode(chunk).cpu())
 
         text_feature_tensor = torch.cat(text_features, dim=0)
@@ -175,7 +181,7 @@ def find_max_activating_examples(
             )
         )
 
-    examples.sort(key=lambda e: e["activation"], reverse=True)
+    # already descending: topk(sorted=True) and the loop appends in rank order.
     return examples
 
 
@@ -254,24 +260,13 @@ def analyze_feature(
     print()
 
 
-def find_interesting_features(
+def feature_activation_stats(
     feature_cache: FeatureCache,
-    sae: "SparseAutoencoder",
-    n_features_to_return: int = 50,
     chunk_size: int = 2048,
-) -> list[int]:
-    """Rank features by mean activation when active, within a 0.1%-20% activation-
-    rate band. Takes n_features, not the SAE - the model served only a shape
-    check."""
+) -> FeatureActivationStats:
+    """Activation rate and mean-when-active for every feature in the cache."""
     fa = feature_cache.feature_acts
-
-    n_features = sae.config.n_features
-    if fa.shape[1] != n_features:
-        raise ValueError(
-            f"FeatureCache has {fa.shape[1]} features but SAE has {n_features}"
-        )
-
-    total_tokens, _ = fa.shape
+    total_tokens, n_features = fa.shape
 
     feature_counts = torch.zeros(n_features, dtype=torch.float32)
     feature_sum_acts = torch.zeros(n_features, dtype=torch.float32)
@@ -283,24 +278,33 @@ def find_interesting_features(
 
     rate = feature_counts / max(total_tokens, 1)
     mean_when_active = feature_sum_acts / feature_counts.clamp(min=1)
+    return FeatureActivationStats(rate=rate, mean_when_active=mean_when_active)
+
+
+def find_interesting_features(
+    feature_cache: FeatureCache,
+    n_features: int,
+    n_return: int = 50,
+    chunk_size: int = 2048,
+) -> list[int]:
+    """Feature indices ranked by mean activation when active (strongest first),
+    restricted to features that fire on 0.1%-20% of tokens with mean-when-active
+    > 0.5: rare enough to be specific."""
+    fa = feature_cache.feature_acts
+    if fa.shape[1] != n_features:
+        raise ValueError(
+            f"FeatureCache has {fa.shape[1]} features but n_features={n_features}"
+        )
+
+    rate, mean_when_active = feature_activation_stats(feature_cache, chunk_size)
 
     mask = (rate > 0.001) & (rate < 0.2) & (mean_when_active > 0.5)
     candidate_indices = mask.nonzero(as_tuple=True)[0].tolist()
 
+    # python sort: stable, so ties keep ascending index order
     ranked = sorted(
         candidate_indices,
         key=lambda i: mean_when_active[i].item(),
         reverse=True,
     )
-
-    print(
-        f"Found {len(ranked)} candidate features in the "
-        f"0.1%-20% activation-rate band:"
-    )
-    for i in ranked[:n_features_to_return]:
-        print(
-            f"  feature {i:5d}: rate={rate[i]:.4f}, "
-            f"mean act when active={mean_when_active[i]:.3f}"
-        )
-
-    return ranked[:n_features_to_return]
+    return ranked[:n_return]
