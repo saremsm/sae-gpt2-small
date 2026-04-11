@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import os
 import random
 from dataclasses import asdict
 
@@ -19,7 +21,9 @@ except ImportError as exc:
     ) from exc
 
 from sparse_autoencoder import SparseAutoencoder, SAEConfig
-from training import InlineActivationSource, train_sae
+from data import ActivationLoader, TokenShard, load_forward_model, resid_post_hook
+from training import BATCH_SIZE, train_sae
+from variance_explained import evaluate_fvu, print_fvu
 from analysis import (
     build_activation_cache,
     build_feature_cache,
@@ -27,6 +31,68 @@ from analysis import (
     find_interesting_features,
     analyze_feature,
 )
+
+
+TARGET_LAYER = 8
+# Schedule knobs are denominated in TOKENS so a different --batch-tokens keeps
+# the same warmup / resampling / logging cadence per token.
+WARMUP_TOKENS = 51_200
+RESAMPLE_TOKENS = 128_000
+LOG_TOKENS = 25_600
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train a layer-8 SAE from a pre-tokenized shard "
+        "(see `python -m data tokenize`)."
+    )
+    parser.add_argument(
+        "--train-shard", default="data/train.bin",
+        help="packed uint16 shard to train on (data.py)",
+    )
+    parser.add_argument(
+        "--holdout-shard", default="data/holdout.bin",
+        help="document-disjoint shard for the post-training FVU; "
+        "skipped with a warning if the file is missing",
+    )
+    parser.add_argument(
+        "--n-tokens", type=int, default=500_000,
+        help="training tokens (position-0 rows excluded)",
+    )
+    parser.add_argument(
+        "--batch-seqs", type=int, default=256,
+        help="sequences per GPT-2 forward in the loader",
+    )
+    parser.add_argument(
+        "--batch-tokens", type=int, default=BATCH_SIZE,
+        help="activations per SAE optimizer step. 512 is the recipe every "
+        "numbers row uses (977 steps for 500K tokens; 90K tok/s on the A10). "
+        "2048 clears the A10 throughput gate (107K tok/s) but at 500K tokens "
+        "that is 244 steps at the same lr and the SAE is badly undertrained "
+        "(FVU 0.82 vs 0.63) - use it for long runs (the MVP run-scale token budgets), "
+        "not for the 500K headline. Warmup / resampling / logging cadence is "
+        "token-denominated so it is the same per token at either batch.",
+    )
+    parser.add_argument(
+        "--buffer-tokens", type=int, default=1_000_000,
+        help="on-device shuffle buffer size in activations "
+        "(x d_model x 4 bytes of GPU memory)",
+    )
+    parser.add_argument(
+        "--eval-tokens", type=int, default=100_000,
+        help="held-out tokens for the FVU report",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--no-autocast", action="store_true",
+        help="run the GPT-2 forward in fp32 instead of bf16 autocast (CUDA)",
+    )
+    parser.add_argument(
+        "--forward", choices=["tl", "hf"], default="hf",
+        help="GPT-2 implementation the activation loader runs (analysis "
+        "always uses TransformerLens): tl = HookedTransformer, hf = "
+        "HuggingFace GPT2Model with SDPA, same residual (data.HFResidualModel)",
+    )
+    return parser.parse_args()
 
 
 def plot_training_history(history: dict, save_path: str = "training_history.png") -> None:
@@ -80,7 +146,9 @@ def plot_training_history(history: dict, save_path: str = "training_history.png"
 
 
 def main() -> None:
-    SEED = 42
+    args = parse_args()
+
+    SEED = args.seed
     random.seed(SEED)
     np.random.seed(SEED)
     torch.manual_seed(SEED)
@@ -95,8 +163,22 @@ def main() -> None:
         device = "cpu"
     print(f"Using device: {device}")
 
+    # Fail on a missing shard before spending time on the model load.
+    if not os.path.exists(args.train_shard):
+        raise SystemExit(
+            f"train shard {args.train_shard!r} not found; build it with "
+            f"`python -m data tokenize ...` (see README, pipeline)."
+        )
+    holdout_shard = args.holdout_shard
+    if not os.path.exists(holdout_shard):
+        print(
+            f"WARNING: holdout shard {holdout_shard!r} not found; the "
+            f"post-training FVU on held-out data will be skipped."
+        )
+        holdout_shard = None
+
     print("\nLoading GPT-2-small via TransformerLens...")
-    model = HookedTransformer.from_pretrained("gpt2")
+    model = HookedTransformer.from_pretrained("gpt2").to(device)
     model.eval()
     print(
         f"Model: {model.cfg.n_layers} layers, "
@@ -104,35 +186,74 @@ def main() -> None:
         f"d_model={model.cfg.d_model}"
     )
 
-    TARGET_LAYER = 8
+    hook_name = resid_post_hook(TARGET_LAYER)
+    # The model the loader forwards through. TL for analysis regardless.
+    if args.forward == "hf":
+        print("Loading GPT-2-small via HuggingFace (SDPA) for the loader...")
+        forward_model = load_forward_model("hf", device)
+    else:
+        forward_model = model
 
-    # warmup_steps=100 vs ~976 expected steps: the previous 1000 kept the whole
+    # warmup 51.2K tokens (100 steps at 512) vs ~976 steps at 512: the previous
+    # 1000-step warmup kept the whole run inside warmup (train_sae also warn-
+    # clamps).
+    warmup_steps = max(10, WARMUP_TOKENS // args.batch_tokens)
+    resample_interval = max(1, RESAMPLE_TOKENS // args.batch_tokens)
+    log_interval = max(1, LOG_TOKENS // args.batch_tokens)
     config = SAEConfig(
         d_model=model.cfg.d_model,
         n_features=3072,
         l1_coefficient=5e-3,
         lr=2e-4,
-        warmup_steps=100,
+        warmup_steps=warmup_steps,
+    )
+    print(
+        f"Schedule: batch_tokens={args.batch_tokens}, warmup {warmup_steps} steps "
+        f"({WARMUP_TOKENS:,} tok), resample every {resample_interval} steps "
+        f"({RESAMPLE_TOKENS:,} tok), log every {log_interval} steps"
     )
 
     sae = SparseAutoencoder(config)
 
-    activation_source = InlineActivationSource(
-        model=model,
-        layer=TARGET_LAYER,
-        batch_size=32,
-        context_length=128,
+    train_shard = TokenShard(args.train_shard)
+    print(
+        f"Train shard: {args.train_shard} ({train_shard.n_seqs:,} seqs x "
+        f"{train_shard.seq_len}, docs {train_shard.meta['doc_range']})"
+    )
+    if args.buffer_tokens > args.n_tokens:
+        print(
+            f"NOTE: --buffer-tokens ({args.buffer_tokens:,}) > --n-tokens "
+            f"({args.n_tokens:,}): the loader fills the whole buffer before "
+            f"the first step and forwards ~buffer/2 tokens more than training "
+            f"consumes, so wall time is dominated by the fill. For short runs "
+            f"lower --buffer-tokens (throughput numbers come from "
+            f"bench_pipeline.py, not from here)."
+        )
+    loader = ActivationLoader(
+        model=forward_model,
+        shard=train_shard,
+        hook_name=hook_name,
+        batch_seqs=args.batch_seqs,
+        batch_tokens=args.batch_tokens,
+        buffer_tokens=args.buffer_tokens,
         device=device,
+        seed=SEED,
+        autocast=not args.no_autocast,
     )
 
     history = train_sae(
         sae=sae,
-        activation_source=activation_source,
-        n_training_tokens=500_000,
-        resample_interval=250,
-        log_interval=50,
+        loader=loader,
+        n_training_tokens=args.n_tokens,
+        resample_interval=resample_interval,
+        log_interval=log_interval,
         device=device,
         seed=SEED,
+    )
+    print(
+        f"Loader ({args.forward}): {loader.tokens_yielded:,} tokens yielded at "
+        f"{loader.throughput_tok_s():,.0f} tok/s end-to-end (GPT-2 forward + "
+        f"SAE step, {loader.n_refills} buffer refills)"
     )
 
     checkpoint_path = "sae_gpt2_layer8.pt"
@@ -143,6 +264,7 @@ def main() -> None:
             "config": asdict(config),
             "layer": TARGET_LAYER,
             "training_history": history,
+            "train_shard": train_shard.meta,
         },
         checkpoint_path,
     )
@@ -152,6 +274,24 @@ def main() -> None:
     )
 
     plot_training_history(history)
+
+    if holdout_shard is not None:
+        print("\nFVU on the held-out shard (position 0 excluded)...")
+        eval_loader = ActivationLoader(
+            model=forward_model,
+            shard=TokenShard(holdout_shard),
+            hook_name=hook_name,
+            batch_seqs=args.batch_seqs,
+            batch_tokens=4096,
+            buffer_tokens=max(8192, min(args.buffer_tokens, 2 * args.eval_tokens)),
+            device=device,
+            seed=SEED,
+            epochs=1,
+            autocast=not args.no_autocast,
+            log_every=0,
+        )
+        result = evaluate_fvu(sae, eval_loader, n_tokens=args.eval_tokens)
+        print_fvu(result, sae.input_scale.item())
 
     print("\nLoading analysis texts...")
     dataset = load_dataset("NeelNanda/pile-10k", split="train")

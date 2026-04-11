@@ -1,6 +1,15 @@
 torch>=2.0.0
 transformer_lens>=1.14.0
 datasets>=2.14.0
+# data.py tokenizes with transformers' GPT-2 tokenizer directly (no model
+# load); it is already a transformer_lens dependency.
+transformers>=4.30.0
+# monology/pile-uncopyrighted streams .jsonl.zst shards; datasets needs
+# this to decompress them and does not pull it in itself.
+zstandard>=0.21
+# torch.cuda.utilization() (bench_pipeline.py's GPU-utilization gate)
+# needs the pynvml module; nvidia-ml-py is the tiny official package.
+nvidia-ml-py>=12.0
 tqdm>=4.65.0
 matplotlib>=3.7.0
 numpy>=1.24.0,<2

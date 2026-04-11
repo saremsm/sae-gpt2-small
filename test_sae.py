@@ -1,5 +1,8 @@
 import dataclasses
+import json
+import os
 
+import numpy as np
 import torch
 import pytest
 
@@ -499,19 +502,19 @@ class TestFindInterestingFeatures:
 
 
 class TestTrainSaeCalibration:
-    """train_sae calibrates input_scale on the first buffer fill."""
+    """train_sae calibrates input_scale on the first batches the loader yields."""
 
     class _SyntheticSource:
-        """yields n_chunks of (chunk_tokens, d) raw activations."""
-        def __init__(self, d: int, chunk_tokens: int, n_chunks: int, scale: float):
-            self.d, self.chunk_tokens, self.n_chunks, self.scale = (
-                d, chunk_tokens, n_chunks, scale,
+        """yields n_chunks batches of (batch_tokens, d) raw activations."""
+        def __init__(self, d: int, batch_tokens: int, n_chunks: int, scale: float):
+            self.d, self.batch_tokens, self.n_chunks, self.scale = (
+                d, batch_tokens, n_chunks, scale,
             )
 
         def __iter__(self):
             g = torch.Generator().manual_seed(0)
             for _ in range(self.n_chunks):
-                yield torch.randn(self.chunk_tokens, self.d, generator=g) * self.scale
+                yield torch.randn(self.batch_tokens, self.d, generator=g) * self.scale
 
     def test_input_scale_calibrated_before_training(self):
         from training import train_sae
@@ -519,7 +522,7 @@ class TestTrainSaeCalibration:
         d, scale = 16, 37.0
         cfg = SAEConfig(d_model=d, n_features=32, l1_coefficient=1e-3, warmup_steps=2)
         sae = SparseAutoencoder(cfg)
-        src = self._SyntheticSource(d=d, chunk_tokens=300, n_chunks=20, scale=scale)
+        src = self._SyntheticSource(d=d, batch_tokens=300, n_chunks=20, scale=scale)
 
         history = train_sae(
             sae, src, n_training_tokens=1024, resample_interval=1000,
@@ -539,10 +542,506 @@ class TestTrainSaeCalibration:
         cfg = SAEConfig(d_model=d, n_features=32, l1_coefficient=1e-3, warmup_steps=2)
         sae = SparseAutoencoder(cfg)
         sae.set_input_scale(0.25)
-        src = self._SyntheticSource(d=d, chunk_tokens=300, n_chunks=10, scale=37.0)
+        src = self._SyntheticSource(d=d, batch_tokens=300, n_chunks=10, scale=37.0)
 
         train_sae(
             sae, src, n_training_tokens=512, resample_interval=1000,
             log_interval=1, device="cpu", calibration_tokens=0,
         )
         assert sae.input_scale.item() == 0.25
+
+    def test_calibration_batches_are_trained_on_then_source_continues(self):
+        """the calibration batches are not discarded: with 4 batches of 256 in the
+        source and calibration on 512, a 1024-token run does 4 steps."""
+        from training import train_sae
+
+        d = 16
+        cfg = SAEConfig(d_model=d, n_features=32, l1_coefficient=1e-3, warmup_steps=2)
+        sae = SparseAutoencoder(cfg)
+        src = self._SyntheticSource(d=d, batch_tokens=256, n_chunks=4, scale=37.0)
+
+        history = train_sae(
+            sae, src, n_training_tokens=2048, resample_interval=1000,
+            log_interval=1, device="cpu", calibration_tokens=512,
+        )
+        assert history["step"] == [1, 2, 3, 4]
+
+
+# data pipeline: shards, tokenization, ActivationLoader
+
+BOS = 50256
+SHARD_SEQS = 64
+SHARD_SEQ_LEN = 32
+
+
+def _write_shard(dir_path, tokens: np.ndarray, seq_len: int):
+    """write a (n_seqs, seq_len) uint16 array as a shard (bin + sidecar) and open
+    it."""
+    from data import TokenShard, shard_meta_path
+
+    bin_path = os.path.join(dir_path, "shard.bin")
+    tokens = np.ascontiguousarray(tokens, dtype=np.uint16)
+    with open(bin_path, "wb") as f:
+        f.write(tokens.tobytes())
+    meta = {
+        "n_tokens": int(tokens.size), "n_seqs": int(tokens.shape[0]),
+        "seq_len": seq_len, "seed": 0, "dataset": "<test>", "split": "train",
+        "text_field": "text", "doc_range": [0, 0], "n_docs": 0,
+        "tokenizer": "gpt2", "bos_id": BOS, "eos_id": BOS, "dtype": "uint16",
+    }
+    with open(shard_meta_path(bin_path), "w") as f:
+        json.dump(meta, f)
+    return TokenShard(bin_path)
+
+
+def _random_shard_tokens(n_seqs: int, seq_len: int, seed: int = 0) -> np.ndarray:
+    """BOS at position 0; column 1 distinct per row so every (row, position >= 1)
+    prefix - hence every non-BOS activation."""
+    rng = np.random.default_rng(seed)
+    tokens = rng.integers(0, 50256, size=(n_seqs, seq_len), dtype=np.uint16)
+    tokens[:, 0] = BOS
+    tokens[:, 1] = 1000 + np.arange(n_seqs)
+    return tokens
+
+
+@pytest.fixture(scope="session")
+def tokenizer():
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained("gpt2")
+
+
+@pytest.fixture(scope="session")
+def loader_shard(tmp_path_factory):
+    d = tmp_path_factory.mktemp("shard")
+    return _write_shard(str(d), _random_shard_tokens(SHARD_SEQS, SHARD_SEQ_LEN), SHARD_SEQ_LEN)
+
+
+@pytest.fixture(scope="session")
+def tiny_model():
+    """random-weight HookedTransformer with GPT-2's vocab (so shard ids are valid)
+    but 3 tiny layers: exercises the exact loader code path hermetically."""
+    from transformer_lens import HookedTransformer, HookedTransformerConfig
+
+    cfg = HookedTransformerConfig(
+        n_layers=3, d_model=32, d_head=8, n_heads=4, d_mlp=64, d_vocab=50257,
+        n_ctx=64, act_fn="gelu_new", normalization_type="LN", seed=0,
+        device="cpu",  # TL defaults to CUDA when present; these tests are CPU
+    )
+    return HookedTransformer(cfg).eval()
+
+
+@pytest.fixture(scope="session")
+def gpt2_model():
+    """the real GPT-2-small. Skips (does not fail) when weights cannot load."""
+    from transformer_lens import HookedTransformer
+
+    try:
+        # and these tests build CPU loaders.
+        #   device="cpu": from_pretrained otherwise picks CUDA when present,
+        return HookedTransformer.from_pretrained("gpt2", device="cpu").eval()
+    except OSError as exc:
+        pytest.skip(f"GPT-2 weights unavailable offline: {exc}")
+
+
+@pytest.fixture(params=["tiny", "gpt2"])
+def model_and_hook(request):
+    """(model, hook_name): the hermetic tiny model at its layer 1."""
+    from data import resid_post_hook
+
+    if request.param == "tiny":
+        return request.getfixturevalue("tiny_model"), resid_post_hook(1)
+    return request.getfixturevalue("gpt2_model"), resid_post_hook(8)
+
+
+def _reference_activations(model, hook_name: str, tokens: torch.Tensor) -> torch.Tensor:
+    """(n_seqs, seq_len, d) activations at hook_name from a plain run_with_cache
+    WITHOUT stop_at_layer."""
+    outs = []
+    with torch.no_grad():
+        for start in range(0, tokens.shape[0], 16):
+            _, cache = model.run_with_cache(tokens[start : start + 16], names_filter=hook_name)
+            outs.append(cache[hook_name].float())
+    return torch.cat(outs, dim=0)
+
+
+class TestTokenizeCorpus:
+    DOCS = [
+        f"Document number {i}. "
+        + "The quick brown fox jumps over the lazy dog. " * (1 + i % 4)
+        for i in range(30)
+    ]
+
+    @staticmethod
+    def _stream(doc_ids: list[list[int]]) -> np.ndarray:
+        """the packed body stream: every doc followed by EOS."""
+        return np.concatenate([np.array(ids + [BOS]) for ids in doc_ids])
+
+    @staticmethod
+    def _rows(path: str, seq_len: int) -> np.ndarray:
+        raw = np.fromfile(path, dtype=np.uint16)
+        return raw.reshape(-1, seq_len)
+
+    def test_packing_from_iterable(self, tmp_path, tokenizer):
+        """BOS at position 0 of every row, then a contiguous stream of docs
+        separated by EOS; uint16 on disk; n_tokens rounded down to whole rows;
+        sidecar carries the contract."""
+        from data import tokenize_corpus
+
+        seq_len, n_tokens = 16, 20 * 16 + 5
+        out = tmp_path / "train.bin"
+        result = tokenize_corpus(
+            [{"text": t} for t in self.DOCS], out_path=str(out),
+            n_tokens=n_tokens, seq_len=seq_len,
+        )
+        meta = result["train"]
+        assert result["holdout"] is None
+        assert meta["n_seqs"] == 20 and meta["n_tokens"] == 320
+        assert meta["dtype"] == "uint16" and meta["seq_len"] == seq_len
+        assert meta["bos_id"] == BOS and meta["tokenizer"] == "gpt2"
+        assert os.path.getsize(out) == 320 * 2  # two bytes per token
+        assert json.load(open(tmp_path / "train.json")) == meta
+
+        rows = self._rows(str(out), seq_len)
+        assert rows.shape == (20, seq_len)
+        assert (rows[:, 0] == BOS).all()
+        expected = self._stream([tokenizer(t)["input_ids"] for t in self.DOCS])
+        assert (rows[:, 1:].reshape(-1) == expected[: 20 * (seq_len - 1)]).all()
+
+    def test_holdout_docs_disjoint_via_load_dataset(self, tmp_path, tokenizer, monkeypatch):
+        """with a dataset name, load_dataset is streamed and shuffled with (seed,
+        buffer_size=10_000)"""
+        import data
+
+        docs = self.DOCS
+        calls = {}
+
+        class _FakeStream:
+            def __init__(self, items):
+                self._items = items
+
+            def shuffle(self, seed, buffer_size):
+                calls["shuffle"] = (seed, buffer_size)
+                order = np.random.default_rng(seed).permutation(len(self._items))
+                return _FakeStream([self._items[i] for i in order])
+
+            def __iter__(self):
+                return iter(self._items)
+
+        def fake_load_dataset(name, split, streaming):
+            calls["load"] = (name, split, streaming)
+            return _FakeStream([{"content": t} for t in docs])
+
+        monkeypatch.setattr(data, "load_dataset", fake_load_dataset)
+        seq_len, holdout_docs = 16, 4
+        result = data.tokenize_corpus(
+            "fake/dataset", split="train", out_path=str(tmp_path / "train.bin"),
+            n_tokens=8 * seq_len, seq_len=seq_len, seed=7, text_field="content",
+            holdout_docs=holdout_docs, holdout_path=str(tmp_path / "holdout.bin"),
+        )
+        assert calls["load"] == ("fake/dataset", "train", True)
+        assert calls["shuffle"] == (7, 10_000)
+
+        order = np.random.default_rng(7).permutation(len(docs))
+        shuffled_ids = [tokenizer(docs[i])["input_ids"] for i in order]
+        hold_stream = self._stream(shuffled_ids[:holdout_docs])
+        train_stream = self._stream(shuffled_ids[holdout_docs:])
+
+        hold_rows = self._rows(str(tmp_path / "holdout.bin"), seq_len)
+        train_rows = self._rows(str(tmp_path / "train.bin"), seq_len)
+        assert (hold_rows[:, 0] == BOS).all() and (train_rows[:, 0] == BOS).all()
+        n_hold = len(hold_stream) // (seq_len - 1)
+        assert hold_rows.shape[0] == n_hold  # everything the docs give
+        assert (hold_rows[:, 1:].reshape(-1) == hold_stream[: n_hold * (seq_len - 1)]).all()
+        assert train_rows.shape[0] == 8
+        assert (train_rows[:, 1:].reshape(-1) == train_stream[: 8 * (seq_len - 1)]).all()
+
+        hm, tm = result["holdout"], result["train"]
+        assert hm["doc_range"] == [0, holdout_docs]
+        assert tm["doc_range"][0] == holdout_docs
+        assert hm["n_docs"] == holdout_docs
+        assert hm["seed"] == tm["seed"] == 7 and tm["dataset"] == "fake/dataset"
+        assert tm["text_field"] == "content"
+
+    @pytest.mark.parametrize("streaming", [True, False])
+    def test_real_datasets_objects_and_cli(self, tmp_path, tokenizer, monkeypatch, streaming):
+        """against real `datasets` objects (IterableDataset.shuffle takes
+        buffer_size, Dataset.shuffle does not) through the CLI entry point; the
+        split is a seeded permutation of the documents either way."""
+        import data
+        from datasets import Dataset
+
+        base = Dataset.from_dict({"text": self.DOCS})
+
+        def fake_load_dataset(name, split, streaming):
+            return base.to_iterable_dataset() if streaming else base
+
+        monkeypatch.setattr(data, "load_dataset", fake_load_dataset)
+        argv = [
+            "tokenize", "--dataset", "fake/ds", "--n-tokens", "160", "--seq-len", "16",
+            "--holdout-docs", "5", "--out", str(tmp_path / "t.bin"),
+            "--holdout-out", str(tmp_path / "h.bin"), "--seed", "3",
+        ]
+        if not streaming:
+            argv.append("--no-streaming")
+        data.main(argv)
+
+        train, hold = data.TokenShard(tmp_path / "t.bin"), data.TokenShard(tmp_path / "h.bin")
+        assert train.n_seqs == 10 and hold.n_seqs >= 1
+        assert hold.meta["doc_range"] == [0, 5] and train.meta["doc_range"][0] == 5
+        # the held-out docs are a strict subset of the corpus and none of them starts.
+        first_hold_doc = tokenizer.decode(hold[0][1:8].tolist())
+        first_train_doc = tokenizer.decode(train[0][1:8].tolist())
+        assert first_hold_doc.startswith("Document number")
+        assert first_train_doc.startswith("Document number")
+        assert first_hold_doc != first_train_doc
+
+    def test_exhausted_stream_writes_what_it_has(self, tmp_path, tokenizer, capsys):
+        from data import tokenize_corpus
+
+        result = tokenize_corpus(
+            self.DOCS[:5], out_path=str(tmp_path / "t.bin"),
+            n_tokens=10_000, seq_len=16,
+        )
+        total = sum(len(tokenizer(t)["input_ids"]) + 1 for t in self.DOCS[:5])
+        assert result["train"]["n_seqs"] == total // 15 < 10_000 // 16
+        assert "WARNING: stream exhausted" in capsys.readouterr().out
+
+    def test_argument_validation(self, tmp_path):
+        from data import tokenize_corpus
+
+        with pytest.raises(ValueError):
+            tokenize_corpus(self.DOCS, out_path=str(tmp_path / "t.bin"),
+                            n_tokens=64, seq_len=16, holdout_docs=2)
+        with pytest.raises(ValueError):
+            tokenize_corpus(self.DOCS, out_path=str(tmp_path / "t.bin"),
+                            n_tokens=8, seq_len=16)
+
+
+class TestTokenShard:
+    def test_round_trip_written_ids_equal_read_ids(self, tmp_path):
+        tokens = _random_shard_tokens(10, 8, seed=3)
+        shard = _write_shard(str(tmp_path), tokens, 8)
+        assert shard.n_seqs == 10 and shard.n_tokens == 80 and len(shard) == 10
+        assert shard.seq_len == 8
+
+        rows = shard[[2, 5, 9]]
+        assert rows.dtype == torch.long and rows.shape == (3, 8)
+        assert np.array_equal(rows.numpy(), tokens[[2, 5, 9]])
+        assert np.array_equal(shard[4].numpy(), tokens[4])
+        assert np.array_equal(shard[torch.tensor([0, 1])].numpy(), tokens[:2])
+        assert np.array_equal(shard[3:6].numpy(), tokens[3:6])
+
+    def test_iter_batches_covers_each_row_once_per_epoch(self, tmp_path):
+        tokens = _random_shard_tokens(10, 8, seed=1)
+        shard = _write_shard(str(tmp_path), tokens, 8)
+        batches = list(shard.iter_batches(4, shuffle=True, seed=0, epochs=2))
+        assert [b.shape[0] for b in batches] == [4, 4, 2, 4, 4, 2]
+        seen = torch.cat(batches).numpy()
+        # column 1 is distinct per row: identifies rows
+        ids_epoch1 = sorted(seen[:10, 1].tolist())
+        ids_epoch2 = sorted(seen[10:, 1].tolist())
+        assert ids_epoch1 == ids_epoch2 == sorted(tokens[:, 1].tolist())
+        assert seen[:10, 1].tolist() != seen[10:, 1].tolist()  # reshuffled
+        ordered = torch.cat(list(shard.iter_batches(3, shuffle=False)))
+        assert np.array_equal(ordered.numpy(), tokens)
+
+    def test_size_mismatch_raises(self, tmp_path):
+        from data import TokenShard
+
+        shard = _write_shard(str(tmp_path), _random_shard_tokens(4, 8), 8)
+        with open(shard.path, "ab") as f:
+            f.write(b"\x00\x00")
+        with pytest.raises(ValueError):
+            TokenShard(shard.path)
+
+
+class TestActivationLoader:
+    def _loader(self, model, hook_name, shard, **kw):
+        from data import ActivationLoader
+
+        kwargs = dict(
+            batch_seqs=8, batch_tokens=128, buffer_tokens=512, device="cpu",
+            seed=0, log_every=0,
+        )
+        kwargs.update(kw)
+        return ActivationLoader(model, shard, hook_name, **kwargs)
+
+    def test_batch_shape_dtype_and_bos_excluded(self, model_and_hook, loader_shard):
+        """batches are (batch_tokens, d_model) float32 and no yielded row is the
+        position-0 activation."""
+        model, hook_name = model_and_hook
+        loader = self._loader(model, hook_name, loader_shard)
+        bos_act = _reference_activations(model, hook_name, loader_shard[[0]])[0, 0]
+
+        for _ in range(3):
+            batch = next(loader)
+            assert batch.shape == (128, model.cfg.d_model)
+            assert batch.dtype == torch.float32
+            dist = (batch - bos_act).norm(dim=-1)
+            assert (dist > 1e-3 * bos_act.norm()).all()
+        assert loader.tokens_yielded == 3 * 128
+        assert loader.throughput_tok_s() > 0
+
+    def test_gpt2_position0_outlier_is_gone(self, gpt2_model, loader_shard):
+        """on the real model the position-0 residual has norm ~3141 vs ~120
+        elsewhere (README notes): with position 0 in, a 128-row batch averages >
+        200 from the outlier alone."""
+        from data import resid_post_hook
+
+        loader = self._loader(gpt2_model, resid_post_hook(8), loader_shard)
+        for _ in range(4):
+            assert next(loader).norm(dim=-1).mean().item() < 500.0
+
+    def test_exclude_bos_false_keeps_position0(self, model_and_hook, loader_shard):
+        model, hook_name = model_and_hook
+        loader = self._loader(model, hook_name, loader_shard, exclude_bos=False, epochs=1)
+        bos_act = _reference_activations(model, hook_name, loader_shard[[0]])[0, 0]
+        rows = torch.cat(list(loader))
+        assert rows.shape[0] == SHARD_SEQS * SHARD_SEQ_LEN  # 2048 = 16 x 128
+        n_bos = ((rows - bos_act).norm(dim=-1) < 1e-3 * bos_act.norm()).sum().item()
+        assert n_bos == SHARD_SEQS
+
+    def test_epoch_yields_each_activation_once_and_matches_full_forward(
+        self, model_and_hook, loader_shard
+    ):
+        """one epoch through a buffer far smaller than the shard (so it refills
+        several times): every yielded row is a non-BOS activation of the shard."""
+        model, hook_name = model_and_hook
+        loader = self._loader(model, hook_name, loader_shard, epochs=1)
+        ref = _reference_activations(model, hook_name, loader_shard[np.arange(SHARD_SEQS)])
+        ref = ref[:, 1:].reshape(-1, model.cfg.d_model)  # drop position 0
+
+        batches = list(loader)
+        assert len(batches) == (SHARD_SEQS * (SHARD_SEQ_LEN - 1)) // 128 == 15
+        assert loader.n_refills >= 3
+        assert loader.tokens_yielded == 15 * 128
+        assert loader.tokens_forwarded == SHARD_SEQS * SHARD_SEQ_LEN
+
+        rows = torch.cat(batches)
+        dists = torch.cdist(rows, ref)
+        min_dist, nearest = dists.min(dim=1)
+        # loader and reference use different batch compositions.
+        assert (min_dist <= 2e-2 * ref[nearest].norm(dim=-1)).all(), min_dist.max()
+        assert nearest.unique().numel() == rows.shape[0], "an activation was yielded twice"
+
+    def test_epochs_none_cycles(self, tiny_model, loader_shard):
+        from data import resid_post_hook
+
+        loader = self._loader(tiny_model, resid_post_hook(1), loader_shard, epochs=None)
+        n = 0
+        for batch in loader:
+            n += batch.shape[0]
+            if n > 3 * SHARD_SEQS * (SHARD_SEQ_LEN - 1):
+                break
+        assert loader.n_chunks > 3 * (SHARD_SEQS // 8)
+
+    def test_argument_validation(self, tiny_model, loader_shard):
+        from data import ActivationLoader, layer_from_hook_name, resid_post_hook
+
+        with pytest.raises(ValueError):
+            ActivationLoader(tiny_model, loader_shard, resid_post_hook(1),
+                             batch_seqs=8, batch_tokens=300, buffer_tokens=512, device="cpu")
+        with pytest.raises(ValueError):
+            ActivationLoader(tiny_model, loader_shard, "hook_embed",
+                             batch_seqs=8, batch_tokens=64, buffer_tokens=512, device="cpu")
+        assert layer_from_hook_name("blocks.8.hook_resid_post") == 8
+        assert resid_post_hook(8) == "blocks.8.hook_resid_post"
+
+
+class TestTrainSaeFromShard:
+    def test_five_steps_on_cpu(self, model_and_hook, loader_shard):
+        """train_sae smoke: 5 steps from a shard through the loader, with
+        calibration and a resample checkpoint on the way."""
+        from data import ActivationLoader
+        from training import train_sae
+
+        model, hook_name = model_and_hook
+        loader = ActivationLoader(
+            model, loader_shard, hook_name, batch_seqs=8, batch_tokens=128,
+            buffer_tokens=512, device="cpu", seed=0, log_every=0,
+        )
+        cfg = SAEConfig(d_model=model.cfg.d_model, n_features=4 * model.cfg.d_model,
+                        l1_coefficient=1e-3, warmup_steps=2)
+        sae = SparseAutoencoder(cfg)
+        history = train_sae(
+            sae, loader, n_training_tokens=5 * 128, resample_interval=3,
+            log_interval=1, device="cpu", calibration_tokens=256,
+        )
+        assert history["step"] == [1, 2, 3, 4, 5]
+        assert all(np.isfinite(history["loss"]))
+        assert sae.input_scale.item() != 1.0
+        assert loader.tokens_yielded == 5 * 128
+
+
+@pytest.fixture(scope="module")
+def random_hf_and_tl():
+    """a random-weight GPT-2-config HF model and the TL model built FROM those same
+    weights with TL's default processing (fold_ln, center_writing_weights, ...)"""
+    from transformers import GPT2Config, GPT2LMHeadModel
+    from transformer_lens import HookedTransformer
+
+    cfg = GPT2Config(n_layer=12, n_embd=768, n_head=12, vocab_size=50257,
+                     n_positions=1024)
+    torch.manual_seed(0)
+    hf = GPT2LMHeadModel(cfg).eval()
+    tl = HookedTransformer.from_pretrained("gpt2", hf_model=hf, device="cpu").eval()
+    return hf, tl
+
+
+class TestHFResidualBackend:
+    """data.HFResidualModel must produce TransformerLens' hook_resid_post exactly."""
+
+    def test_hf_backend_matches_transformerlens_resid_post(self, random_hf_and_tl, loader_shard):
+        """HF-after-block-8 minus per-token mean == TL blocks.8.hook_resid_post to
+        1e-4, and without the centring they differ - so the test is sensitive."""
+        from data import HFResidualModel, resid_post_hook
+
+        hf, tl = random_hf_and_tl
+        backend = HFResidualModel(hf, center=True)
+        assert backend.cfg.d_model == tl.cfg.d_model == 768
+
+        tokens = loader_shard[np.arange(8)]
+        with torch.no_grad():
+            _, cache = tl.run_with_cache(tokens, names_filter=resid_post_hook(8),
+                                         stop_at_layer=9)
+            tl_resid = cache[resid_post_hook(8)]
+            hf_resid = backend.resid_post(tokens, 8)
+            hf_uncentered = HFResidualModel(hf, center=False).resid_post(tokens, 8)
+        scale = tl_resid.norm(dim=-1).mean()
+        assert (hf_resid - tl_resid).abs().max() < 1e-4 * scale
+        assert (hf_uncentered - tl_resid).abs().max() > 1e-3 * scale
+
+    def test_loader_yields_same_activations_either_backend(self, random_hf_and_tl, loader_shard):
+        """the ActivationLoader driven by the HF backend and by TL (same seed)
+        yields the same batches in the same order."""
+        from data import ActivationLoader, HFResidualModel, resid_post_hook
+
+        hf, tl = random_hf_and_tl
+        kw = dict(batch_seqs=8, batch_tokens=128, buffer_tokens=512, device="cpu",
+                  seed=0, log_every=0)
+        a = ActivationLoader(HFResidualModel(hf), loader_shard, resid_post_hook(8), **kw)
+        b = ActivationLoader(tl, loader_shard, resid_post_hook(8), **kw)
+        for _ in range(3):
+            xa, xb = next(a), next(b)
+            assert xa.shape == xb.shape == (128, 768)
+            assert (xa - xb).abs().max() < 1e-4 * xb.norm(dim=-1).mean()
+
+    def test_real_gpt2_hf_backend_matches(self, gpt2_model, loader_shard):
+        """same check against the real weights (skips offline like the other GPT-2
+        tests): the shipped `--forward hf` path is exact."""
+        from data import HFResidualModel, resid_post_hook
+
+        try:
+            backend = HFResidualModel.from_pretrained("gpt2", device="cpu")
+        except OSError as exc:
+            pytest.skip(f"HF GPT-2 weights unavailable offline: {exc}")
+        tokens = loader_shard[np.arange(8)]
+        with torch.no_grad():
+            _, cache = gpt2_model.run_with_cache(tokens, names_filter=resid_post_hook(8),
+                                                 stop_at_layer=9)
+            tl_resid = cache[resid_post_hook(8)]
+            hf_resid = backend.resid_post(tokens, 8)
+        # position 0 is the ~3000-norm outlier; compare relative to each row
+        rel = (hf_resid - tl_resid).norm(dim=-1) / tl_resid.norm(dim=-1)
+        assert rel.max() < 1e-4

@@ -5,125 +5,27 @@ from typing import Iterator, Protocol, TypedDict, runtime_checkable
 
 import torch
 
-from sparse_autoencoder import SparseAutoencoder
+from sparse_autoencoder import SAEOutput, SparseAutoencoder
 from torch.optim import AdamW
 from tqdm import tqdm
-
-try:
-    from transformer_lens import HookedTransformer
-    from datasets import load_dataset
-except ImportError as exc:
-    raise ImportError(
-        "Run: pip install transformer_lens datasets"
-    ) from exc
 
 
 @runtime_checkable
 class ActivationSource(Protocol):
-    """yields (n_tokens, d_model) float32 tensors of residual activations."""
+    """Iterable of (batch_tokens, d_model) float32 tensors of RAW residual
+    activations, already shuffled and already on the training device."""
+
+    batch_tokens: int
 
     def __iter__(self) -> Iterator[torch.Tensor]:
         ...
 
 
-class InlineActivationSource:
-    """stream residual activations from `model` at `layer`."""
-
-    def __init__(
-        self,
-        model: HookedTransformer,
-        layer: int,
-        dataset_name: str = "NeelNanda/pile-10k",
-        batch_size: int = 32,
-        context_length: int = 128,
-        device: str = "cpu",
-        max_batches: int | None = None,
-    ) -> None:
-        self.model = model
-        self.layer = layer
-        self.dataset_name = dataset_name
-        self.batch_size = batch_size
-        self.context_length = context_length
-        self.device = device
-        self.max_batches = max_batches
-        self._hook_name = f"blocks.{layer}.hook_resid_post"
-        self._epoch = 0
-
-        tokenizer = model.tokenizer
-        bos = tokenizer.bos_token_id
-        if bos is None:
-            bos = tokenizer.eos_token_id
-        if bos is None:
-            raise ValueError(
-                "tokenizer has neither bos_token_id nor eos_token_id"
-            )
-        self._bos_id = bos
-
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-    def _tokenize_batch(
-        self, texts: list[str]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        encoding = self.model.tokenizer(
-            texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.context_length - 1,
-        )
-        input_ids = encoding["input_ids"]
-        attn_mask = encoding["attention_mask"]
-
-        n = input_ids.shape[0]
-        bos_col = torch.full((n, 1), self._bos_id, dtype=input_ids.dtype)
-        bos_mask = torch.ones((n, 1), dtype=attn_mask.dtype)
-        tokens = torch.cat([bos_col, input_ids], dim=1)
-        attn_mask = torch.cat([bos_mask, attn_mask], dim=1)
-        return tokens, attn_mask
-
-    def __iter__(self) -> Iterator[torch.Tensor]:
-        # no trust_remote_code: datasets>=3 ignores it and prints a warning on every.
-        dataset = load_dataset(self.dataset_name, split="train")
-        if self._epoch > 0:
-            # Re-shuffle on repeat passes: epoch 2 must not replay epoch 1 byte-
-            dataset = dataset.shuffle(seed=self._epoch)
-        self._epoch += 1
-        self.model.eval()
-
-        batch_count = 0
-        texts: list[str] = []
-
-        for item in dataset:
-            text = item.get("text", item.get("content", ""))
-            if not text or len(text) < 50:
-                continue
-            texts.append(text)
-
-            if len(texts) < self.batch_size:
-                continue
-
-            tokens, attn_mask = self._tokenize_batch(texts)
-
-            with torch.no_grad():
-                _, cache = self.model.run_with_cache(
-                    tokens.to(self.device),
-                    names_filter=self._hook_name,
-                )
-
-            acts = cache[self._hook_name].cpu()
-            yield acts[attn_mask.bool()]
-
-            texts = []
-            batch_count += 1
-            if self.max_batches is not None and batch_count >= self.max_batches:
-                return
-
-
+# Default SAE batch (activations per optimizer step)
 BATCH_SIZE = 512
-BUFFER_TARGET_TOKENS = 65_536
 RENORM_INTERVAL = 100
-# batches feeding the resampling pool. 8 x 512 x 768 fp32 ~ 12 MB.
+# batches feeding the resampling pool. 8 x 512 x 768 fp32 ~ 12 MB, kept on the
+# training device (a per-step .cpu() would sync every step).
 RESAMPLE_POOL_BATCHES = 8
 
 
@@ -144,9 +46,26 @@ def _make_lr_lambda(warmup_steps: int):
     return lr_lambda
 
 
+def train_step(
+    sae: SparseAutoencoder,
+    optimizer: torch.optim.Optimizer,
+    batch: torch.Tensor,
+) -> SAEOutput:
+    """One optimizer step on a batch of raw residuals: forward, backward, decoder-
+    gradient projection, grad clipping, optimizer.step()."""
+    output = sae(batch)
+    optimizer.zero_grad(set_to_none=True)
+    output.loss.backward()
+    if sae.config.normalize_decoder:
+        sae.project_decoder_grad()
+    torch.nn.utils.clip_grad_norm_(sae.parameters(), max_norm=1.0)
+    optimizer.step()
+    return output
+
+
 def train_sae(
     sae: SparseAutoencoder,
-    activation_source: ActivationSource,
+    loader: ActivationSource,
     n_training_tokens: int = 5_000_000,
     resample_interval: int = 5_000,
     log_interval: int = 100,
@@ -154,7 +73,7 @@ def train_sae(
     seed: int = 42,
     calibration_tokens: int = 100_000,
 ) -> TrainingHistory:
-    """Train `sae` on raw residuals from `activation_source`."""
+    """Train `sae` on raw residual batches from `loader`."""
     torch.manual_seed(seed)
     if device == "cuda":
         torch.cuda.manual_seed_all(seed)
@@ -164,7 +83,8 @@ def train_sae(
     optimizer = AdamW(sae.parameters(), lr=sae.config.lr, weight_decay=0.0)
 
     # Guard a silent failure: the original warmup_steps=1000 vs ~976-step run
-    expected_steps = max(1, n_training_tokens // BATCH_SIZE)
+    batch_tokens = loader.batch_tokens
+    expected_steps = max(1, n_training_tokens // batch_tokens)
     warmup_steps = sae.config.warmup_steps
     if warmup_steps >= expected_steps:
         clamped = max(10, expected_steps // 20)
@@ -189,62 +109,42 @@ def train_sae(
         "act_norm": [],
     }
 
-    src_iter = iter(activation_source)
-    buffer = torch.empty(0, sae.config.d_model)
-    buffer_offset = 0
-
-    def refill_buffer(target_tokens: int = BUFFER_TARGET_TOKENS) -> None:
-        nonlocal buffer, buffer_offset, src_iter
-
-        chunks: list[torch.Tensor] = []
-        if buffer_offset < buffer.shape[0]:
-            chunks.append(buffer[buffer_offset:])
-        buffer_offset = 0
-
-        total = sum(c.shape[0] for c in chunks)
-        restarts = 0
-        while total < target_tokens:
-            try:
-                chunk = next(src_iter)
-            except StopIteration:
-                if restarts >= 1:
-                    break
-                src_iter = iter(activation_source)
-                restarts += 1
-                continue
-            chunks.append(chunk)
-            total += chunk.shape[0]
-
-        if not chunks or total == 0:
-            buffer = torch.empty(0, sae.config.d_model)
-            return
-
-        flat = torch.cat(chunks, dim=0)
-        perm = torch.randperm(flat.shape[0])
-        buffer = flat[perm].contiguous()
+    src_iter = iter(loader)
 
     # Calibrate the SAE's dataset-wide input scale (sqrt(d) / mean ||x||)
+    stash: deque[torch.Tensor] = deque()
     n_calib = 0
     if calibration_tokens > 0:
         print(
             f"Calibrating input_scale on >= {calibration_tokens:,} raw "
             f"tokens..."
         )
-        refill_buffer(max(BUFFER_TARGET_TOKENS, calibration_tokens))
-        n_calib = buffer.shape[0]
+        while n_calib < calibration_tokens:
+            try:
+                batch = next(src_iter)
+            except StopIteration:
+                break
+            stash.append(batch)
+            n_calib += batch.shape[0]
         if n_calib == 0:
             print(
-                "WARNING: activation source yielded no tokens; input_scale "
-                f"left at {sae.input_scale.item():.4g}."
+                "WARNING: loader yielded no tokens; input_scale left at "
+                f"{sae.input_scale.item():.4g}."
             )
         else:
             if n_calib < calibration_tokens:
                 print(
                     f"WARNING: only {n_calib:,} tokens available for "
                     f"input_scale calibration (wanted {calibration_tokens:,}); "
-                    f"the source is exhausted, calibrating on what there is."
+                    f"the loader is exhausted, calibrating on what there is."
                 )
-            sae.set_input_scale_from_activations(buffer)
+            sae.set_input_scale_from_activations(torch.cat(list(stash)))
+
+    def batches() -> Iterator[torch.Tensor]:
+        # popleft so calibration batches are freed as they are consumed rather than
+        while stash:
+            yield stash.popleft()
+        yield from src_iter
 
     print("=" * 60)
     print("Training SAE")
@@ -256,7 +156,7 @@ def train_sae(
         f"  LR schedule   : {sae.config.lr} with "
         f"{warmup_steps}-step warmup"
     )
-    print(f"  Target tokens : {n_training_tokens:,}")
+    print(f"  Target tokens : {n_training_tokens:,} ({batch_tokens} per step)")
     calib_note = (
         f"calibrated on {n_calib:,} tokens" if n_calib
         else "not calibrated in this call"
@@ -278,36 +178,23 @@ def train_sae(
     tokens_trained = 0
     pbar = tqdm(total=n_training_tokens, unit="tok")
 
+    batch_iter = batches()
     while tokens_trained < n_training_tokens:
-        if buffer.shape[0] - buffer_offset < BATCH_SIZE:
-            refill_buffer()
-            if buffer.shape[0] - buffer_offset < BATCH_SIZE:
-                break
-
+        try:
+            batch = next(batch_iter)
+        except StopIteration:
+            break
         # Raw residuals: the SAE applies input_scale internally.
-        batch = buffer[buffer_offset : buffer_offset + BATCH_SIZE].to(device)
-        buffer_offset += BATCH_SIZE
+        batch = batch.to(device)
 
-        output = sae(batch)
-
-        optimizer.zero_grad()
-        output.loss.backward()
-        if sae.config.normalize_decoder:
-            sae.project_decoder_grad()
-        torch.nn.utils.clip_grad_norm_(sae.parameters(), max_norm=1.0)
-        optimizer.step()
+        output = train_step(sae, optimizer, batch)
         scheduler.step()
 
         if sae.config.normalize_decoder and step % RENORM_INTERVAL == 0:
             sae.normalize_decoder()
 
-        # clone(): CPU-path .cpu() is a no-op VIEW into the 64K-token buffer.
-        resample_pool.append(
-            (
-                batch.detach().cpu().clone(),
-                output.per_token_recon_error.cpu().clone(),
-            )
-        )
+        # Loader batches are owned tensors and per_token_recon_error is already.
+        resample_pool.append((batch.detach(), output.per_token_recon_error))
 
         step += 1
         tokens_trained += batch.shape[0]
@@ -316,12 +203,8 @@ def train_sae(
         if step % resample_interval == 0:
             dead_indices = sae.get_dead_features(threshold=0)
             if len(dead_indices) > 0:
-                pool_acts = torch.cat(
-                    [acts for acts, _ in resample_pool]
-                ).to(device)
-                pool_errors = torch.cat(
-                    [errs for _, errs in resample_pool]
-                ).to(device)
+                pool_acts = torch.cat([acts for acts, _ in resample_pool])
+                pool_errors = torch.cat([errs for _, errs in resample_pool])
                 sae.resample_dead_features(
                     dead_feature_indices=dead_indices,
                     activations=pool_acts,
@@ -357,6 +240,11 @@ def train_sae(
             )
 
     pbar.close()
+    if tokens_trained < n_training_tokens:
+        print(
+            f"WARNING: loader ended after {tokens_trained:,} tokens "
+            f"(wanted {n_training_tokens:,})."
+        )
     if history["loss"]:
         print("\nTraining complete.")
         print(f"  Final loss        : {history['loss'][-1]:.4f} (scaled space)")
