@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import time
 from dataclasses import asdict
 
 import numpy as np
@@ -23,7 +24,13 @@ except ImportError as exc:
 from sparse_autoencoder import SparseAutoencoder, SAEConfig
 from data import ActivationLoader, TokenShard, load_forward_model, resid_post_hook
 from training import BATCH_SIZE, train_sae
-from variance_explained import evaluate_fvu, print_fvu
+from eval import (
+    evaluate,
+    make_run_record,
+    print_metrics,
+    utc_now_iso,
+    write_json,
+)
 from analysis import (
     build_activation_cache,
     build_feature_cache,
@@ -51,7 +58,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--holdout-shard", default="data/holdout.bin",
-        help="document-disjoint shard for the post-training FVU; "
+        help="document-disjoint shard for the post-training evaluation "
+        "(eval.evaluate: FVU, L0, CE clean/recon/zero, loss recovered); "
         "skipped with a warning if the file is missing",
     )
     parser.add_argument(
@@ -78,8 +86,23 @@ def parse_args() -> argparse.Namespace:
         "(x d_model x 4 bytes of GPU memory)",
     )
     parser.add_argument(
-        "--eval-tokens", type=int, default=100_000,
-        help="held-out tokens for the FVU report",
+        "--eval-tokens", type=int, default=2_000_000,
+        help="held-out tokens for the post-training evaluation (position-0 "
+        "rows not counted); three fp32 GPT-2 forwards per token",
+    )
+    parser.add_argument(
+        "--eval-batch-seqs", type=int, default=64,
+        help="rows per GPT-2 forward in the evaluation (fp32 logits are "
+        "b x seq_len x 50257: 64 rows ~ 1.7 GB)",
+    )
+    parser.add_argument(
+        "--run-name", default=None,
+        help="name of the results/<run>/ directory that receives "
+        "metrics.json (default: UTC timestamp)",
+    )
+    parser.add_argument(
+        "--results-dir", default="results",
+        help="parent directory of results/<run>/",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -147,6 +170,7 @@ def plot_training_history(history: dict, save_path: str = "training_history.png"
 
 def main() -> None:
     args = parse_args()
+    started_at = utc_now_iso()
 
     SEED = args.seed
     random.seed(SEED)
@@ -173,7 +197,8 @@ def main() -> None:
     if not os.path.exists(holdout_shard):
         print(
             f"WARNING: holdout shard {holdout_shard!r} not found; the "
-            f"post-training FVU on held-out data will be skipped."
+            f"post-training held-out evaluation is skipped (metrics is null "
+            f"in metrics.json)."
         )
         holdout_shard = None
 
@@ -241,6 +266,7 @@ def main() -> None:
         autocast=not args.no_autocast,
     )
 
+    t_train = time.perf_counter()
     history = train_sae(
         sae=sae,
         loader=loader,
@@ -250,6 +276,7 @@ def main() -> None:
         device=device,
         seed=SEED,
     )
+    train_wall = time.perf_counter() - t_train
     print(
         f"Loader ({args.forward}): {loader.tokens_yielded:,} tokens yielded at "
         f"{loader.throughput_tok_s():,.0f} tok/s end-to-end (GPT-2 forward + "
@@ -275,23 +302,62 @@ def main() -> None:
 
     plot_training_history(history)
 
+    metrics = None
+    holdout_meta = None
     if holdout_shard is not None:
-        print("\nFVU on the held-out shard (position 0 excluded)...")
-        eval_loader = ActivationLoader(
-            model=forward_model,
-            shard=TokenShard(holdout_shard),
-            hook_name=hook_name,
-            batch_seqs=args.batch_seqs,
-            batch_tokens=4096,
-            buffer_tokens=max(8192, min(args.buffer_tokens, 2 * args.eval_tokens)),
-            device=device,
-            seed=SEED,
-            epochs=1,
-            autocast=not args.no_autocast,
-            log_every=0,
+        print(
+            f"\nEvaluating on the held-out shard ({args.eval_tokens:,} tokens, "
+            f"position 0 excluded; 3 fp32 forwards per batch)..."
         )
-        result = evaluate_fvu(sae, eval_loader, n_tokens=args.eval_tokens)
-        print_fvu(result, sae.input_scale.item())
+        holdout = TokenShard(holdout_shard)
+        holdout_meta = holdout.meta
+        # train_meta: refuses to run if the two shards' document ranges overlap.
+        metrics = evaluate(
+            sae, model, holdout, hook_name,
+            n_tokens=args.eval_tokens, batch_seqs=args.eval_batch_seqs,
+            device=device, exclude_bos=True, train_meta=train_shard.meta,
+        )
+        print_metrics(metrics, sae.input_scale.item())
+
+    run_name = args.run_name or time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    record = make_run_record(
+        run=run_name,
+        config={
+            "sae": asdict(config),
+            "layer": TARGET_LAYER,
+            "hook_name": hook_name,
+            "device": device,
+            "args": vars(args),
+            "schedule": {
+                "warmup_steps": warmup_steps,
+                "resample_interval": resample_interval,
+                "log_interval": log_interval,
+            },
+        },
+        metrics=metrics,
+        started_at=started_at,
+        train_shard=train_shard.meta,
+        holdout_shard=holdout_meta,
+        checkpoint=checkpoint_path,
+        training={
+            "tokens": loader.tokens_yielded,
+            "steps": history["step"][-1] if history["step"] else 0,
+            "final_loss": history["loss"][-1] if history["loss"] else None,
+            "final_l0": history["l0"][-1] if history["l0"] else None,
+            "final_dead_features": (
+                history["dead_features"][-1] if history["dead_features"] else None
+            ),
+            "input_scale": sae.input_scale.item(),
+            "loader_tok_s": loader.throughput_tok_s(),
+            "train_wall_seconds": train_wall,
+        },
+    )
+    metrics_path = write_json(
+        os.path.join(args.results_dir, run_name, "metrics.json"), record
+    )
+    print(f"metrics written to {metrics_path}")
+    if metrics is None:
+        print("(no held-out shard: metrics is null in metrics.json)")
 
     print("\nLoading analysis texts...")
     dataset = load_dataset("NeelNanda/pile-10k", split="train")

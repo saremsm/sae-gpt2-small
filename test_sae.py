@@ -1045,3 +1045,336 @@ class TestHFResidualBackend:
         # position 0 is the ~3000-norm outlier; compare relative to each row
         rel = (hf_resid - tl_resid).norm(dim=-1) / tl_resid.norm(dim=-1)
         assert rel.max() < 1e-4
+
+# held-out evaluator (eval.py)
+
+
+def _exact_sae(d: int, input_scale: float = 0.3) -> SparseAutoencoder:
+    """W_dec = [I; -I], W_enc = W_dec.T, zero biases: decode(encode(x)) == relu(x) -
+    relu(-x) == x, so recon_raw == x for any input_scale."""
+    cfg = SAEConfig(d_model=d, n_features=2 * d, l1_coefficient=0.0)
+    sae = SparseAutoencoder(cfg).eval()
+    with torch.no_grad():
+        eye = torch.eye(d)
+        sae.W_dec.copy_(torch.cat([eye, -eye], dim=0))
+        sae.W_enc.copy_(sae.W_dec.T)
+        sae.b_enc.zero_()
+        sae.b_dec.zero_()
+    sae.set_input_scale(input_scale)
+    return sae
+
+
+def _zero_sae(d: int, n_features: int = 64) -> SparseAutoencoder:
+    """h == 0 on every input and b_dec == 0: recon_raw is all zeros, so the
+    reconstruction splice IS a zero-ablation of the same positions."""
+    sae = SparseAutoencoder(SAEConfig(d_model=d, n_features=n_features)).eval()
+    with torch.no_grad():
+        sae.W_enc.zero_()
+        sae.b_enc.zero_()
+        sae.b_dec.zero_()
+    sae.set_input_scale(0.3)
+    return sae
+
+
+def _meta(dataset="pile", split="train", seed=0, doc_range=(0, 0)) -> dict:
+    return {"dataset": dataset, "split": split, "seed": seed,
+            "doc_range": list(doc_range)}
+
+
+@pytest.fixture(scope="session")
+def gpt2_text_shard(tmp_path_factory, tokenizer):
+    """16 rows x 64 of packed real text (tokenize_corpus over in-memory docs) for
+    the real-GPT-2 evaluator tests: zero-ablating layer 8 on English text raises."""
+    from data import TokenShard, tokenize_corpus
+
+    docs = [
+        f"Paragraph {i}. The committee met on Tuesday to discuss the budget "
+        f"for the coming year, and after a long debate the members agreed "
+        f"to postpone the decision until more information was available. "
+        * (2 + i % 3)
+        for i in range(40)
+    ]
+    d = tmp_path_factory.mktemp("gpt2_eval_shard")
+    tokenize_corpus(docs, out_path=str(d / "holdout.bin"), n_tokens=16 * 64, seq_len=64)
+    shard = TokenShard(d / "holdout.bin")
+    assert shard.n_seqs == 16
+    return shard
+
+
+class TestCheckHoldoutDisjoint:
+    def test_overlap_raises(self):
+        from eval import check_holdout_disjoint
+
+        with pytest.raises(ValueError, match="overlaps"):
+            check_holdout_disjoint(_meta(doc_range=(0, 100)), _meta(doc_range=(50, 500)))
+        with pytest.raises(ValueError, match="overlaps"):
+            check_holdout_disjoint(_meta(doc_range=(0, 100)), _meta(doc_range=(0, 100)))
+        # containment is overlap too
+        with pytest.raises(ValueError, match="overlaps"):
+            check_holdout_disjoint(_meta(doc_range=(10, 20)), _meta(doc_range=(0, 100)))
+
+    def test_disjoint_passes(self):
+        from eval import check_holdout_disjoint
+
+        # the tokenize_corpus layout: holdout first, train after it
+        check_holdout_disjoint(_meta(doc_range=(0, 100)), _meta(doc_range=(100, 500)))
+        # empty ranges (the test shards) never overlap
+        check_holdout_disjoint(_meta(doc_range=(0, 0)), _meta(doc_range=(0, 0)))
+        # different corpora are disjoint by construction, whatever the ranges
+        check_holdout_disjoint(_meta(dataset="owt", doc_range=(0, 100)),
+                               _meta(dataset="pile", doc_range=(0, 100)))
+
+    def test_same_dataset_other_seed_or_split_cannot_be_certified(self):
+        from eval import check_holdout_disjoint
+
+        with pytest.raises(ValueError, match="cannot be certified"):
+            check_holdout_disjoint(_meta(seed=1, doc_range=(0, 10)), _meta(seed=0, doc_range=(10, 20)))
+        with pytest.raises(ValueError, match="cannot be certified"):
+            check_holdout_disjoint(_meta(split="test", doc_range=(0, 10)), _meta(doc_range=(10, 20)))
+        with pytest.raises(ValueError, match="doc_range"):
+            check_holdout_disjoint({"dataset": "pile"}, _meta())
+
+    def test_evaluate_refuses_overlapping_shards_before_running(self, tiny_model, loader_shard):
+        """evaluate(train_meta=...) with an overlapping doc_range raises before any
+        forward: the model never sees a hook."""
+        from data import resid_post_hook
+        from eval import evaluate
+
+        holdout_meta = dict(loader_shard.meta, doc_range=[0, 10])
+        train_meta = dict(loader_shard.meta, doc_range=[5, 50])
+        loader_shard.meta = holdout_meta  # session fixture: restore below
+        try:
+            with pytest.raises(ValueError, match="overlaps"):
+                evaluate(_exact_sae(tiny_model.cfg.d_model), tiny_model, loader_shard,
+                         resid_post_hook(1), n_tokens=64, batch_seqs=8, device="cpu",
+                         train_meta=train_meta)
+        finally:
+            loader_shard.meta = dict(loader_shard.meta, doc_range=[0, 0])
+        assert not any(hp.fwd_hooks for hp in tiny_model.hook_dict.values())
+
+
+class TestEvaluate:
+    HOOK = "blocks.1.hook_resid_post"
+
+    def _eval(self, sae, model, shard, **kw):
+        from eval import evaluate
+
+        kwargs = dict(n_tokens=64 * 31, batch_seqs=8, device="cpu", log_every=0)
+        kwargs.update(kw)
+        return evaluate(sae, model, shard, self.HOOK, **kwargs)
+
+    def test_exact_sae_fvu_zero_and_identity_loss_recovered_one(self, tiny_model, loader_shard):
+        """constructed exact reconstruction: fvu ~ 0, mse ~ 0, ce_recon == ce_clean
+        so loss_recovered ~ 1."""
+        from eval import METRIC_KEYS
+
+        d = tiny_model.cfg.d_model
+        m = self._eval(_exact_sae(d), tiny_model, loader_shard)
+        assert set(METRIC_KEYS) <= set(m)
+        assert m["n_tokens"] == 64 * 31 and m["n_seqs"] == 64
+        assert m["fvu"] < 1e-8 and m["mse_raw"] < 1e-8
+        assert abs(m["variance_explained"] - 1.0) < 1e-8
+        assert abs(m["ce_recon"] - m["ce_clean"]) < 1e-5
+        assert abs(m["loss_recovered"] - 1.0) < 1e-3
+        assert m["ce_zero"] != m["ce_clean"]  # else loss_recovered proves nothing
+        assert m["l0"] == pytest.approx(d)  # relu(x) - relu(-x): one of each pair
+        assert m["dead_frac_eval"] == 0.0 and not m["identity"] and m["exclude_bos"]
+
+        for sae in (_exact_sae(d), SparseAutoencoder(SAEConfig(d_model=d, n_features=4 * d)).eval()):
+            mi = self._eval(sae, tiny_model, loader_shard, identity=True)
+            assert mi["identity"] and mi["fvu"] == 0.0 and mi["mse_raw"] == 0.0
+            assert abs(mi["loss_recovered"] - 1.0) <= 1e-3
+            assert mi["ce_recon"] == pytest.approx(m["ce_clean"], abs=1e-6)
+        # ...while the random SAE itself does not reconstruct
+        assert self._eval(sae, tiny_model, loader_shard)["fvu"] > 0.1
+
+    def test_fvu_l0_ce_match_two_pass_reference(self, tiny_model, loader_shard):
+        """streaming (Welford) FVU over batches == a two-pass FVU over the whole
+        eval set from run_with_cache; L0 == the SAE's own; ce_clean ==
+        model(tokens, return_type='loss')"""
+        d = tiny_model.cfg.d_model
+        torch.manual_seed(1)
+        sae = SparseAutoencoder(SAEConfig(d_model=d, n_features=4 * d)).eval()
+        sae.set_input_scale(0.3)
+        m = self._eval(sae, tiny_model, loader_shard, n_tokens=1000)
+        assert m["n_tokens"] == 5 * 248 and m["n_seqs"] == 40
+
+        tokens = loader_shard[np.arange(40)]
+        with torch.no_grad():
+            _, cache = tiny_model.run_with_cache(tokens, names_filter=self.HOOK)
+            x = cache[self.HOOK][:, 1:].reshape(-1, d).double()
+            out = sae(x.float())
+            fvu = ((x - out.recon_raw.double()) ** 2).sum() / ((x - x.mean(0)) ** 2).sum()
+            ce = tiny_model(tokens, return_type="loss").item()
+        assert m["fvu"] == pytest.approx(fvu.item(), rel=1e-6)
+        assert m["mse_raw"] == pytest.approx(
+            ((x - out.recon_raw.double()) ** 2).mean().item(), rel=1e-6)
+        assert m["mse_scaled"] == pytest.approx(m["mse_raw"] * 0.3 ** 2, rel=1e-6)
+        assert m["l0"] == pytest.approx(out.l0.item(), rel=1e-5)
+        assert m["ce_clean"] == pytest.approx(ce, abs=1e-5)
+        n_dead = int(((out.h > 0).sum(0) == 0).sum())
+        assert m["n_dead_eval"] == n_dead
+        assert m["dead_frac_eval"] == pytest.approx(n_dead / (4 * d))
+
+    def test_zero_sae_equals_zero_ablation_and_bos_is_untouched(self, tiny_model, loader_shard):
+        """an SAE whose reconstruction is all zeros splices exactly what the zero-
+        ablation writes at exactly the same positions: ce_recon == ce_zero,
+        loss_recovered == 0, l0 == 0, every feature dead on eval."""
+        d = tiny_model.cfg.d_model
+        m = self._eval(_zero_sae(d), tiny_model, loader_shard)
+        assert m["ce_recon"] == pytest.approx(m["ce_zero"], abs=1e-6)
+        assert abs(m["loss_recovered"]) < 1e-3
+        assert m["l0"] == 0.0 and m["dead_frac_eval"] == 1.0
+        assert m["fvu"] > 0.5  # zeros explain nothing (about the mean, less)
+
+        m_all = self._eval(_zero_sae(d), tiny_model, loader_shard, exclude_bos=False)
+        assert not m_all["exclude_bos"]
+        assert m_all["n_tokens"] == 64 * 32  # position 0 counted now
+        assert m_all["ce_recon"] == pytest.approx(m_all["ce_zero"], abs=1e-6)
+        assert m_all["ce_clean"] == pytest.approx(m["ce_clean"], abs=1e-6)
+        assert abs(m_all["ce_zero"] - m["ce_zero"]) > 1e-4  # BOS zeroed too
+
+    def test_argument_validation(self, tiny_model, loader_shard):
+        from eval import evaluate
+
+        d = tiny_model.cfg.d_model
+        with pytest.raises(ValueError):
+            evaluate(_exact_sae(d), tiny_model, loader_shard, self.HOOK,
+                     n_tokens=0, batch_seqs=8, device="cpu")
+        with pytest.raises(ValueError):
+            evaluate(_exact_sae(d), tiny_model, loader_shard, self.HOOK,
+                     n_tokens=10, batch_seqs=0, device="cpu")
+        with pytest.raises(ValueError, match="d_model"):
+            evaluate(_exact_sae(d + 1), tiny_model, loader_shard, self.HOOK,
+                     n_tokens=10, batch_seqs=8, device="cpu")
+
+    def test_real_gpt2_zero_ablation_ce_above_clean(self, gpt2_model, gpt2_text_shard):
+        """real GPT-2, 16 seqs of packed English text, layer-8 hook: zero- ablating
+        the residual raises the loss (by nats, not noise), the identity splice
+        recovers it exactly (loss_recovered == 1 to 1e-3, fvu == 0)"""
+        from data import resid_post_hook
+        from eval import evaluate
+
+        hook = resid_post_hook(8)
+        d = gpt2_model.cfg.d_model
+        m = evaluate(_exact_sae(d, input_scale=0.228), gpt2_model, gpt2_text_shard, hook,
+                     n_tokens=16 * 63, batch_seqs=8, device="cpu", identity=True)
+        assert m["n_tokens"] == 16 * 63 and m["n_seqs"] == 16
+        assert m["ce_zero"] > m["ce_clean"] + 0.5
+        assert m["fvu"] == 0.0
+        assert abs(m["loss_recovered"] - 1.0) <= 1e-3
+        with torch.no_grad():
+            ce = gpt2_model(gpt2_text_shard[np.arange(16)], return_type="loss").item()
+        assert m["ce_clean"] == pytest.approx(ce, abs=1e-4)
+        assert m["ce_clean"] < 6.0  # English text, not random ids
+
+
+class TestRunRecord:
+    def _fake_metrics(self) -> dict:
+        from eval import METRIC_KEYS
+
+        vals = {k: 0.5 for k in METRIC_KEYS}
+        vals.update(n_tokens=1000, n_seqs=8, n_dead_eval=3, exclude_bos=True,
+                    identity=False, hook_name="blocks.8.hook_resid_post")
+        return vals
+
+    def test_metrics_json_schema(self, tmp_path):
+        """results/<run>/metrics.json: every RUN_RECORD_KEYS key, config + all
+        METRIC_KEYS + ISO-8601 UTC timestamps + git SHA (None or hex), round-
+        trips through JSON."""
+        import datetime
+        from eval import (METRIC_KEYS, RUN_RECORD_KEYS, make_run_record,
+                          utc_now_iso, write_json)
+
+        started = utc_now_iso()
+        record = make_run_record(
+            run="test-run", config={"sae": {"d_model": 8}, "args": {"n_tokens": 5}},
+            metrics=self._fake_metrics(), started_at=started,
+            train_shard=_meta(doc_range=(10, 20)), holdout_shard=_meta(doc_range=(0, 10)),
+            checkpoint="sae.pt", training={"steps": 3},
+        )
+        path = write_json(tmp_path / "results" / "test-run" / "metrics.json", record)
+        loaded = json.load(open(path))
+        assert set(RUN_RECORD_KEYS) <= set(loaded)
+        assert loaded["run"] == "test-run"
+        assert loaded["config"]["sae"]["d_model"] == 8
+        assert set(METRIC_KEYS) <= set(loaded["metrics"])
+        assert loaded["metrics"]["n_tokens"] == 1000
+        for key in ("started_at", "finished_at"):
+            ts = datetime.datetime.fromisoformat(loaded[key])
+            assert ts.tzinfo is not None and ts.utcoffset().total_seconds() == 0
+        assert loaded["finished_at"] >= loaded["started_at"]
+        sha = loaded["git_sha"]
+        assert sha is None or (len(sha) == 40 and all(c in "0123456789abcdef" for c in sha))
+        assert loaded["train_shard"]["doc_range"] == [10, 20]
+        assert loaded["checkpoint"] == "sae.pt" and loaded["training"] == {"steps": 3}
+
+    def test_missing_metric_key_raises_and_none_is_allowed(self):
+        from eval import make_run_record, utc_now_iso
+
+        metrics = self._fake_metrics()
+        del metrics["loss_recovered"]
+        with pytest.raises(ValueError, match="loss_recovered"):
+            make_run_record("r", {}, metrics, utc_now_iso())
+        record = make_run_record("r", {}, None, utc_now_iso())
+        assert record["metrics"] is None
+
+    def test_load_checkpoint_round_trip(self, tmp_path):
+        """the main.py checkpoint layout (plain-dict config, state_dict with
+        input_scale) loads under weights_only=True."""
+        import dataclasses
+        from eval import load_checkpoint
+
+        cfg = SAEConfig(d_model=D_MODEL, n_features=N_FEATURES, l1_coefficient=1e-3)
+        sae = SparseAutoencoder(cfg)
+        sae.set_input_scale(0.2281)
+        path = tmp_path / "ckpt.pt"
+        torch.save({"sae_state_dict": sae.state_dict(), "config": dataclasses.asdict(cfg),
+                    "layer": 8, "train_shard": _meta()}, path)
+        loaded, ckpt = load_checkpoint(str(path), "cpu")
+        assert loaded.config == cfg and not loaded.training
+        assert loaded.input_scale.item() == pytest.approx(0.2281)
+        assert torch.equal(loaded.W_dec, sae.W_dec)
+        assert ckpt["layer"] == 8 and ckpt["train_shard"]["doc_range"] == [0, 0]
+
+    def test_eval_cli_identity_mode(self, tmp_path, tiny_model, loader_shard, monkeypatch, capsys):
+        """`python -m eval --identity` end to end on the tiny model (its
+        from_pretrained monkeypatched away; --device cpu because the tiny model
+        lives on CPU even on a CUDA box): loads the checkpoint."""
+        import dataclasses
+        import eval as eval_mod
+        import transformer_lens
+
+        monkeypatch.setattr(
+            transformer_lens.HookedTransformer, "from_pretrained",
+            classmethod(lambda cls, *a, **k: tiny_model),
+        )
+        cfg = SAEConfig(d_model=tiny_model.cfg.d_model, n_features=64)
+        sae = SparseAutoencoder(cfg)
+        sae.set_input_scale(0.3)
+        ckpt = tmp_path / "ckpt.pt"
+        torch.save({"sae_state_dict": sae.state_dict(), "config": dataclasses.asdict(cfg),
+                    "layer": 1, "train_shard": dict(loader_shard.meta, doc_range=[100, 200])},
+                   ckpt)
+        out_json = tmp_path / "m.json"
+        eval_mod.main(["--checkpoint", str(ckpt), "--holdout", str(loader_shard.path),
+                       "--n-tokens", "500", "--batch-seqs", "8", "--identity",
+                       "--json", str(out_json), "--device", "cpu"])
+        printed = capsys.readouterr().out
+        assert "identity check       : OK" in printed
+        m = json.load(open(out_json))
+        assert m["identity"] and m["fvu"] == 0.0 and abs(m["loss_recovered"] - 1) <= 1e-3
+        assert m["hook_name"] == "blocks.1.hook_resid_post" and m["n_tokens"] == 3 * 248
+
+        # a held-out shard whose sidecar says docs [0, 10) vs a checkpoint trained.
+        from data import shard_meta_path
+
+        overlap = _write_shard(str(tmp_path), _random_shard_tokens(16, SHARD_SEQ_LEN), SHARD_SEQ_LEN)
+        with open(shard_meta_path(overlap.path), "w") as f:
+            json.dump(dict(overlap.meta, doc_range=[0, 10]), f)
+        torch.save({"sae_state_dict": sae.state_dict(), "config": dataclasses.asdict(cfg),
+                    "layer": 1, "train_shard": dict(overlap.meta, doc_range=[0, 5])},
+                   ckpt)
+        with pytest.raises(ValueError, match="overlaps"):
+            eval_mod.main(["--checkpoint", str(ckpt), "--holdout", str(overlap.path),
+                           "--n-tokens", "500", "--batch-seqs", "8", "--device", "cpu"])
