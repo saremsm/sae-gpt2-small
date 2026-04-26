@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 
 @dataclass(frozen=True)
@@ -20,6 +20,51 @@ class SAEConfig:
     normalize_decoder: bool = True
     # The SAE owns its input contract: raw residuals are multiplied by one.
     normalize_input: bool = True
+    # Encoder nonlinearity. "relu": h = relu(pre), sparsity from the L1 penalty
+    # (l1_coefficient).
+    activation: Literal["relu", "topk"] = "relu"
+    # Number of latents kept per token under "topk".
+    k: int | None = None
+    # AuxK (Gao et al. 2024, topk only, off by default): each training step, take
+    # the top-aux_k pre-activations among currently DEAD features
+    # (feature_activation_counts == 0 in the current window)
+    aux_k: int = 0
+    aux_coeff: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.activation not in ("relu", "topk"):
+            raise ValueError(
+                f"activation must be 'relu' or 'topk', got {self.activation!r}"
+            )
+        if self.activation == "topk":
+            if self.k is None:
+                raise ValueError("activation='topk' requires k")
+            if not (1 <= self.k <= self.n_features):
+                raise ValueError(
+                    f"k must be in [1, n_features={self.n_features}], "
+                    f"got {self.k}"
+                )
+            if self.l1_coefficient != 0.0:
+                warnings.warn(
+                    f"activation='topk' ignores the L1 penalty; forcing "
+                    f"l1_coefficient={self.l1_coefficient} to 0.0 (pass "
+                    f"l1_coefficient=0.0 to silence this).",
+                    stacklevel=3,
+                )
+                object.__setattr__(self, "l1_coefficient", 0.0)
+        elif self.k is not None:
+            raise ValueError(
+                f"k={self.k} is only meaningful with activation='topk'"
+            )
+        if self.aux_k < 0 or self.aux_k > self.n_features:
+            raise ValueError(
+                f"aux_k must be in [0, n_features={self.n_features}], "
+                f"got {self.aux_k}"
+            )
+        if self.aux_k > 0 and self.activation != "topk":
+            raise ValueError("aux_k > 0 requires activation='topk'")
+        if self.aux_coeff < 0.0:
+            raise ValueError(f"aux_coeff must be >= 0, got {self.aux_coeff}")
 
     @property
     def expansion_factor(self) -> float:
@@ -31,12 +76,16 @@ class SAEOutput(NamedTuple):
     recon_scaled: torch.Tensor
     # postprocess(recon_scaled): raw residual space, spliceable back into the
     recon_raw: torch.Tensor
-    # Feature activations (post-ReLU).
+    # Feature activations: post-ReLU ("relu") or the ReLU'd top-k pre-activations.
     h: torch.Tensor
+    # reconstruction_loss + l1_coefficient * sparsity_loss + aux_coeff * aux_loss.
     loss: torch.Tensor
     # MSE in scaled space.
     reconstruction_loss: torch.Tensor
+    # sum_i |h_i| per token, averaged over the batch.
     sparsity_loss: torch.Tensor
+    # AuxK MSE(residual, aux_recon) in scaled space, unweighted.
+    aux_loss: torch.Tensor
     l0: torch.Tensor
     # Per-token reconstruction error (scaled space, detached) - resampling
     per_token_recon_error: torch.Tensor
@@ -119,10 +168,29 @@ class SparseAutoencoder(nn.Module):
             grad.sub_((inner / norms_sq) * W)
 
     # Forward paths
+    @property
+    def activation(self) -> str:
+        return self.config.activation
+
+    @property
+    def k(self) -> int | None:
+        return self.config.k
+
+    def pre_activations(self, x_scaled: torch.Tensor) -> torch.Tensor:
+        """Encoder pre-activations (x_scaled - b_dec) @ W_enc + b_enc for inputs."""
+        return (x_scaled - self.b_dec) @ self.W_enc + self.b_enc
+
+    def apply_activation(self, pre: torch.Tensor) -> torch.Tensor:
+        """Pre-activations -> feature activations h, same shape. Gradient flows only
+        through the kept latents - the scatter of the top-k values."""
+        if self.config.activation == "relu":
+            return F.relu(pre)
+        top_vals, top_idx = pre.topk(self.config.k, dim=-1)
+        h = torch.zeros_like(pre)
+        return h.scatter(-1, top_idx, F.relu(top_vals))
+
     def _encode_preprocessed(self, x: torch.Tensor) -> torch.Tensor:
-        x_centered = x - self.b_dec
-        pre_activations = x_centered @ self.W_enc + self.b_enc
-        return F.relu(pre_activations)
+        return self.apply_activation(self.pre_activations(x))
 
     def encode(self, x_raw: torch.Tensor) -> torch.Tensor:
         """Feature activations for RAW residuals."""
@@ -132,15 +200,42 @@ class SparseAutoencoder(nn.Module):
         """Reconstruction in SCALED space; postprocess for raw space."""
         return h @ self.W_dec + self.b_dec
 
+    def aux_loss(
+        self,
+        pre: torch.Tensor,
+        x_scaled: torch.Tensor,
+        recon_scaled: torch.Tensor,
+    ) -> torch.Tensor:
+        """AuxK term (Gao et al. 2024): MSE between the detached residual (x_scaled
+        - recon_scaled) and its reconstruction from the top-aux_k pre-activations
+        among currently dead features."""
+        dead = self.feature_activation_counts == 0
+        residual = (x_scaled - recon_scaled).detach()
+        # Only dead features may be selected: alive ones go to -inf.
+        pre_dead = pre.masked_fill(~dead, float("-inf"))
+        top_vals, top_idx = pre_dead.topk(self.config.aux_k, dim=-1)
+        h_aux = torch.zeros_like(pre).scatter(-1, top_idx, F.relu(top_vals))
+        aux_recon = h_aux @ self.W_dec
+        return F.mse_loss(aux_recon, residual) * dead.any().to(pre.dtype)
+
     def forward(self, x_raw: torch.Tensor) -> SAEOutput:
-        """raw residuals in; loss/MSE in scaled space, recon_raw mapped back to raw."""
+        """Raw residuals in. Dead-feature bookkeeping is the same under both:
+        feature_activation_counts counts h > 0 per feature."""
         x = self.preprocess(x_raw)
-        h = self._encode_preprocessed(x)
+        pre = self.pre_activations(x)
+        h = self.apply_activation(pre)
         recon_scaled = self.decode(h)
 
         reconstruction_loss = F.mse_loss(recon_scaled, x)
         sparsity_loss = h.abs().sum(dim=-1).mean()
         loss = reconstruction_loss + self.config.l1_coefficient * sparsity_loss
+
+        # Dead mask from the counts as they stand BEFORE this batch is added.
+        if self.config.aux_k > 0 and self.training:
+            aux_loss = self.aux_loss(pre, x, recon_scaled)
+            loss = loss + self.config.aux_coeff * aux_loss
+        else:
+            aux_loss = loss.new_zeros(())
 
         l0 = (h > 0).float().sum(dim=-1).mean()
         per_token_recon_error = (
@@ -158,6 +253,7 @@ class SparseAutoencoder(nn.Module):
             loss=loss,
             reconstruction_loss=reconstruction_loss,
             sparsity_loss=sparsity_loss,
+            aux_loss=aux_loss,
             l0=l0,
             per_token_recon_error=per_token_recon_error,
         )

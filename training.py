@@ -34,6 +34,8 @@ class TrainingHistory(TypedDict):
     loss: list[float]
     reconstruction_loss: list[float]
     sparsity_loss: list[float]
+    # AuxK term (unweighted MSE); all zeros unless aux_k > 0.
+    aux_loss: list[float]
     l0: list[float]
     dead_features: list[int]
     act_norm: list[float]
@@ -104,6 +106,7 @@ def train_sae(
         "loss": [],
         "reconstruction_loss": [],
         "sparsity_loss": [],
+        "aux_loss": [],
         "l0": [],
         "dead_features": [],
         "act_norm": [],
@@ -152,6 +155,17 @@ def train_sae(
         f"  Features      : {sae.config.n_features} "
         f"(d_model={sae.config.d_model})"
     )
+    if sae.config.activation == "topk":
+        aux_note = (
+            f"AuxK aux_k={sae.config.aux_k}, aux_coeff={sae.config.aux_coeff}"
+            if sae.config.aux_k > 0 else "AuxK off"
+        )
+        print(f"  Activation    : topk, k={sae.config.k} ({aux_note})")
+    else:
+        print(
+            f"  Activation    : relu, l1_coefficient="
+            f"{sae.config.l1_coefficient}"
+        )
     print(
         f"  LR schedule   : {sae.config.lr} with "
         f"{warmup_steps}-step warmup"
@@ -226,6 +240,7 @@ def train_sae(
                 output.reconstruction_loss.item()
             )
             history["sparsity_loss"].append(output.sparsity_loss.item())
+            history["aux_loss"].append(output.aux_loss.item())
             history["l0"].append(output.l0.item())
             history["dead_features"].append(n_dead)
             history["act_norm"].append(act_norm)

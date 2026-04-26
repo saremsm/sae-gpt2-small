@@ -264,7 +264,9 @@ def feature_activation_stats(
     feature_cache: FeatureCache,
     chunk_size: int = 2048,
 ) -> FeatureActivationStats:
-    """Activation rate and mean-when-active for every feature in the cache."""
+    """Activation rate and mean-when-active for every feature in the cache. Reduced
+    in chunks of chunk_size tokens so the (chunk > 0) float mask is never
+    materialised for the whole (total_tokens, n_features) cache at once."""
     fa = feature_cache.feature_acts
     total_tokens, n_features = fa.shape
 

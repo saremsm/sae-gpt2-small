@@ -361,6 +361,269 @@ class TestResampleDeadFeatures:
         assert (state_dec["exp_avg_sq"][dead_indices] == 0).all().item()
 
 
+class TestTopK:
+    """activation="topk" (Gao et al. 2024): per token keep the k largest pre-
+    activations (ReLU'd), zero the rest; loss is MSE only."""
+
+    K = 8
+
+    def _topk_sae(self, **overrides) -> SparseAutoencoder:
+        kw = dict(
+            d_model=D_MODEL, n_features=N_FEATURES, l1_coefficient=0.0,
+            lr=2e-4, warmup_steps=10, activation="topk", k=self.K,
+        )
+        kw.update(overrides)
+        return SparseAutoencoder(SAEConfig(**kw))
+
+    def test_config_validation(self):
+        """topk needs k in [1, n_features]; k is rejected under relu; aux_k needs
+        topk; a non-zero l1_coefficient under topk warns and is forced to 0 (so
+        the checkpointed config is honest)."""
+        with pytest.raises(ValueError, match="requires k"):
+            SAEConfig(d_model=D_MODEL, n_features=N_FEATURES, activation="topk")
+        with pytest.raises(ValueError, match="k must be"):
+            SAEConfig(d_model=D_MODEL, n_features=N_FEATURES, activation="topk",
+                      k=N_FEATURES + 1)
+        with pytest.raises(ValueError, match="k must be"):
+            SAEConfig(d_model=D_MODEL, n_features=N_FEATURES, activation="topk", k=0)
+        with pytest.raises(ValueError, match="only meaningful"):
+            SAEConfig(d_model=D_MODEL, n_features=N_FEATURES, k=8)
+        with pytest.raises(ValueError, match="requires activation"):
+            SAEConfig(d_model=D_MODEL, n_features=N_FEATURES, aux_k=4)
+        with pytest.raises(ValueError, match="activation must be"):
+            SAEConfig(d_model=D_MODEL, n_features=N_FEATURES, activation="jumprelu")
+        with pytest.warns(UserWarning, match="l1_coefficient"):
+            cfg = SAEConfig(d_model=D_MODEL, n_features=N_FEATURES,
+                            activation="topk", k=8, l1_coefficient=5e-3)
+        assert cfg.l1_coefficient == 0.0
+        # the default is still relu, k None: existing callers unchanged
+        default = SAEConfig(d_model=D_MODEL, n_features=N_FEATURES)
+        assert default.activation == "relu" and default.k is None
+        assert default.aux_k == 0 and default.aux_coeff == 0.0
+
+    def test_relu_path_unchanged(self, sae):
+        """the default SAE still returns relu(pre): the refactor into."""
+        x = torch.randn(BATCH_SIZE, D_MODEL)
+        pre = sae.pre_activations(sae.preprocess(x))
+        assert torch.equal(sae.encode(x), torch.relu(pre))
+        assert sae.activation == "relu" and sae.k is None
+
+    def test_l0_equals_k_exactly_when_enough_positive(self):
+        """with every pre-activation positive (b_enc pushed up) every token has
+        EXACTLY k non-zeros, and h agrees with the top-k of the pre-activations;
+        the same input through eval-mode forward gives l0 == k."""
+        sae = self._topk_sae().eval()
+        x = torch.randn(BATCH_SIZE, D_MODEL)
+        with torch.no_grad():
+            sae.b_enc.fill_(100.0)
+        h = sae.encode(x)
+        assert h.shape == (BATCH_SIZE, N_FEATURES)
+        assert (h >= 0).all()
+        assert ((h > 0).sum(dim=-1) == self.K).all(), (h > 0).sum(dim=-1)
+
+        pre = sae.pre_activations(sae.preprocess(x))
+        assert (pre > 0).all()  # else the test proves nothing
+        top_vals, top_idx = pre.topk(self.K, dim=-1)
+        assert torch.allclose(h.gather(-1, top_idx), top_vals)
+        # nothing outside the top k survives
+        mask = torch.zeros_like(h, dtype=torch.bool).scatter(-1, top_idx, True)
+        assert (h[~mask] == 0).all()
+
+        out = sae(x)
+        assert out.l0.item() == pytest.approx(self.K)
+        assert torch.equal(out.h, h)
+
+        with torch.no_grad():
+            sae.b_enc.fill_(-100.0)
+        assert (sae.encode(x) == 0).all()
+        assert sae(x).l0.item() == 0.0
+
+    def test_topk_is_per_token(self):
+        """the top k is taken over the feature dim of every token independently: two
+        tokens with different rankings keep different latents."""
+        sae = self._topk_sae().eval()
+        with torch.no_grad():
+            sae.b_enc.fill_(50.0)
+        x = torch.randn(3, D_MODEL)
+        x = torch.cat([x, x[:1]])
+        h = sae.encode(x)
+        active = [set((h[i] > 0).nonzero(as_tuple=True)[0].tolist()) for i in range(4)]
+        assert all(len(a) == self.K for a in active)
+        assert active[0] == active[3]
+        assert active[0] != active[1]
+
+    def test_gradient_flows_only_through_selected_latents(self):
+        """d(sum h^2)/d(pre) is non-zero exactly on the kept latents; through a full
+        forward, W_enc columns / W_dec rows of features that were never selected
+        in the batch get zero gradient."""
+        sae = self._topk_sae()
+        with torch.no_grad():
+            sae.b_enc.fill_(50.0)  # all pre-activations positive
+        x = torch.randn(BATCH_SIZE, D_MODEL)
+
+        pre = sae.pre_activations(sae.preprocess(x))
+        pre.retain_grad()
+        h = sae.apply_activation(pre)
+        (h ** 2).sum().backward()
+        selected = h > 0
+        assert selected.sum(dim=-1).eq(self.K).all()
+        assert (pre.grad[selected] != 0).all()
+        assert (pre.grad[~selected] == 0).all()
+
+        sae.zero_grad(set_to_none=True)
+        out = sae(x)
+        out.loss.backward()
+        ever_selected = selected.any(dim=0)
+        assert 0 < int(ever_selected.sum()) < N_FEATURES  # both sides populated
+        assert (sae.W_enc.grad[:, ~ever_selected] == 0).all()
+        assert (sae.b_enc.grad[~ever_selected] == 0).all()
+        assert (sae.W_dec.grad[~ever_selected] == 0).all()
+        assert (sae.W_dec.grad[ever_selected] != 0).any()
+
+    def test_loss_is_mse_only(self):
+        """topk without AuxK: loss == reconstruction MSE, sparsity_loss is still
+        reported (L1 of the kept latents) but carries weight 0."""
+        sae = self._topk_sae()
+        x = torch.randn(BATCH_SIZE, D_MODEL)
+        out = sae(x)
+        assert torch.equal(out.loss, out.reconstruction_loss)
+        assert out.aux_loss.item() == 0.0
+        assert out.sparsity_loss.item() > 0
+
+    def test_checkpoint_round_trip_carries_activation_and_k(self, tmp_path):
+        """the main.py checkpoint layout (asdict(config) + state_dict) through
+        eval.load_checkpoint: activation, k, aux_k."""
+        from eval import load_checkpoint
+
+        sae = self._topk_sae(aux_k=16, aux_coeff=1 / 32).eval()
+        sae.set_input_scale(0.2281)
+        path = tmp_path / "topk.pt"
+        torch.save({"sae_state_dict": sae.state_dict(),
+                    "config": dataclasses.asdict(sae.config), "layer": 8}, path)
+        loaded, ckpt = load_checkpoint(str(path), "cpu")
+        assert ckpt["config"]["activation"] == "topk" and ckpt["config"]["k"] == self.K
+        assert loaded.config == sae.config
+        assert loaded.activation == "topk" and loaded.k == self.K
+        assert loaded.config.aux_k == 16 and loaded.config.aux_coeff == 1 / 32
+        assert loaded.config.l1_coefficient == 0.0
+        x = torch.randn(BATCH_SIZE, D_MODEL) * 150.0
+        assert torch.equal(loaded.encode(x), sae.encode(x))
+        assert ((loaded.encode(x) > 0).sum(dim=-1) <= self.K).all()
+
+    def test_aux_loss_zero_without_dead_positive_with_dead(self):
+        """train mode, aux_k > 0: no dead feature -> aux_loss 0 and loss == MSE;
+        some dead -> aux_loss > 0 and loss == MSE + aux_coeff * aux."""
+        coeff = 1 / 32
+        sae = self._topk_sae(aux_k=4, aux_coeff=coeff).train()
+        x = torch.randn(BATCH_SIZE, D_MODEL)
+
+        with torch.no_grad():
+            sae.feature_activation_counts.fill_(1)
+        out = sae(x)
+        assert out.aux_loss.item() == 0.0
+        assert torch.equal(out.loss, out.reconstruction_loss)
+
+        with torch.no_grad():
+            sae.feature_activation_counts.fill_(1)
+            sae.feature_activation_counts[:8] = 0
+        out = sae(x)
+        assert out.aux_loss.item() > 0.0
+        assert out.loss.item() == pytest.approx(
+            out.reconstruction_loss.item() + coeff * out.aux_loss.item(), rel=1e-6
+        )
+        assert out.aux_loss.requires_grad
+
+        with torch.no_grad():
+            sae.feature_activation_counts.fill_(1)
+            sae.feature_activation_counts[:8] = 0
+            sae.W_dec[:8] = 0.0
+        out = sae(x)
+        residual = sae.preprocess(x) - out.recon_scaled
+        assert out.aux_loss.item() == pytest.approx(
+            residual.pow(2).mean().item(), rel=1e-5
+        )
+
+    def test_aux_gradient_reaches_only_dead_features(self):
+        """the aux term's gradient lands on the dead features' W_dec rows and W_enc
+        columns and nowhere else (the residual is detached, so the live
+        dictionary gets nothing from it). aux_k (16) > the 8 dead features."""
+        sae = self._topk_sae(aux_k=16, aux_coeff=1.0).train()
+        with torch.no_grad():
+            sae.b_enc.fill_(50.0)
+            sae.feature_activation_counts.fill_(1)
+            sae.feature_activation_counts[:8] = 0
+        x = torch.randn(BATCH_SIZE, D_MODEL)
+        pre = sae.pre_activations(sae.preprocess(x))
+        recon = sae.decode(sae.apply_activation(pre))
+        aux = sae.aux_loss(pre, sae.preprocess(x), recon)
+        aux.backward()
+        assert torch.isfinite(aux).item() and aux.item() > 0
+        for p in (sae.W_dec, sae.W_enc, sae.b_enc):
+            assert torch.isfinite(p.grad).all()
+        assert (sae.W_dec.grad[8:] == 0).all()
+        assert (sae.W_dec.grad[:8] != 0).any()
+        assert (sae.W_enc.grad[:, 8:] == 0).all()
+        assert (sae.b_enc.grad[8:] == 0).all()
+
+    def test_aux_is_training_only(self):
+        """in eval mode the AuxK term is 0 whatever the counts say."""
+        sae = self._topk_sae(aux_k=4, aux_coeff=1.0).eval()
+        x = torch.randn(BATCH_SIZE, D_MODEL)
+        assert (sae.feature_activation_counts == 0).all()
+        out = sae(x)
+        assert out.aux_loss.item() == 0.0
+        assert torch.equal(out.loss, out.reconstruction_loss)
+
+    def test_counts_and_resampling_work_under_topk(self):
+        """feature_activation_counts accumulate (h > 0) under topk exactly as under
+        relu, and resample_dead_features runs unchanged on them: counts zeroed,
+        resampled decoder rows unit norm, adam state reset."""
+        sae = self._topk_sae().train()
+        optimizer = torch.optim.AdamW(sae.parameters(), lr=1e-3)
+        x = torch.randn(BATCH_SIZE, D_MODEL)
+        out = sae(x)
+        assert sae.feature_activation_counts.sum().item() == int((out.h > 0).sum())
+        assert 0 < sae.feature_activation_counts.sum().item() <= BATCH_SIZE * self.K
+        optimizer.zero_grad()
+        out.loss.backward()
+        optimizer.step()
+
+        dead = sae.get_dead_features(threshold=0)
+        assert len(dead) > 0  # 16 tokens x 8 latents cannot cover 256 features
+        sae.resample_dead_features(dead, x * 150.0, torch.rand(BATCH_SIZE),
+                                   optimizer=optimizer)
+        assert (sae.feature_activation_counts == 0).all()
+        assert torch.allclose(sae.W_dec.data[dead].norm(dim=1),
+                              torch.ones(len(dead)), atol=1e-5)
+        assert (optimizer.state[sae.W_enc]["exp_avg"][:, dead] == 0).all()
+        # and the SAE still encodes exactly k per token afterwards
+        with torch.no_grad():
+            sae.b_enc.fill_(50.0)
+        assert ((sae.encode(x) > 0).sum(dim=-1) == self.K).all()
+
+    def test_train_sae_topk_five_steps(self):
+        """training smoke: 5 steps of train_sae under topk + AuxK on a synthetic
+        source (CPU, hermetic), resampling firing on the way."""
+        from training import train_sae
+
+        cfg = SAEConfig(d_model=D_MODEL, n_features=N_FEATURES, l1_coefficient=0.0,
+                        warmup_steps=2, activation="topk", k=self.K,
+                        aux_k=2 * self.K, aux_coeff=1 / 32)
+        sae = SparseAutoencoder(cfg)
+        src = TestTrainSaeCalibration._SyntheticSource(
+            d=D_MODEL, batch_tokens=64, n_chunks=8, scale=37.0)
+        history = train_sae(
+            sae, src, n_training_tokens=5 * 64, resample_interval=3,
+            log_interval=1, device="cpu", calibration_tokens=128,
+        )
+        assert history["step"] == [1, 2, 3, 4, 5]
+        assert all(np.isfinite(history["loss"]))
+        assert all(l0 <= self.K + 1e-6 for l0 in history["l0"])
+        assert len(history["aux_loss"]) == 5 and all(v >= 0 for v in history["aux_loss"])
+        assert sae.input_scale.item() != 1.0
+        assert ((sae.eval().encode(next(iter(src))) > 0).sum(dim=-1) <= self.K).all()
+
+
 class TestFindMaxActivatingExamples:
     @pytest.fixture
     def minimal_cache(self) -> FeatureCache:
@@ -499,6 +762,42 @@ class TestFindInterestingFeatures:
         )
         assert find_interesting_features(cache, n_features=3) == [1, 2, 0]
         assert find_interesting_features(cache, n_features=3, n_return=2) == [1, 2]
+
+    def test_topk_feature_cache_queries_work(self):
+        """the analysis queries make no ReLU-sparsity assumption: on a FeatureCache
+        built from a topk SAE (exactly k non-zeros per token)
+        find_interesting_features returns in-band features and"""
+        from analysis import build_feature_cache, ActivationCache
+
+        k = 8
+        torch.manual_seed(0)
+        cfg = SAEConfig(d_model=D_MODEL, n_features=N_FEATURES, l1_coefficient=0.0,
+                        activation="topk", k=k)
+        sae = SparseAutoencoder(cfg)
+        with torch.no_grad():
+            sae.b_enc.fill_(1.0)  # ensure the kept latents are > 0.5
+        acts = [torch.randn(40, D_MODEL), torch.randn(25, D_MODEL)]
+        cache = build_feature_cache(
+            sae,
+            ActivationCache(activations=acts,
+                            token_strings=[[f"a{i}" for i in range(40)],
+                                           [f"b{i}" for i in range(25)]],
+                            texts=["A", "B"]),
+        )
+        assert cache.feature_acts.shape == (65, N_FEATURES)
+        assert ((cache.feature_acts > 0).sum(dim=-1) == k).all()
+
+        stats = feature_activation_stats(cache)
+        assert stats.rate.sum().item() == pytest.approx(k)  # sum of rates == k
+        interesting = find_interesting_features(cache, n_features=N_FEATURES)
+        assert interesting  # k / n_features = 3% mean rate: inside the band
+        for f in interesting:
+            assert 0.001 < stats.rate[f].item() < 0.2
+        top = find_max_activating_examples(cache, interesting[0], top_k=3)
+        assert top and all(e["activation"] > 0 for e in top)
+        # attribution round-trips: the peak token string is the one at (text,
+        for e in top:
+            assert e["peak_token"][0] in ("a", "b")
 
 
 class TestTrainSaeCalibration:
@@ -971,6 +1270,32 @@ class TestTrainSaeFromShard:
         assert history["step"] == [1, 2, 3, 4, 5]
         assert all(np.isfinite(history["loss"]))
         assert sae.input_scale.item() != 1.0
+        assert loader.tokens_yielded == 5 * 128
+
+    def test_five_steps_topk_on_cpu(self, model_and_hook, loader_shard):
+        """the same 5-step smoke with activation=topk (+ AuxK) through the real
+        loader path: MSE-only loss, L0 <= k at every logged step, resample
+        checkpoint at step 3 taken."""
+        from data import ActivationLoader
+        from training import train_sae
+
+        model, hook_name = model_and_hook
+        loader = ActivationLoader(
+            model, loader_shard, hook_name, batch_seqs=8, batch_tokens=128,
+            buffer_tokens=512, device="cpu", seed=0, log_every=0,
+        )
+        k = 16
+        cfg = SAEConfig(d_model=model.cfg.d_model, n_features=4 * model.cfg.d_model,
+                        l1_coefficient=0.0, warmup_steps=2, activation="topk", k=k,
+                        aux_k=2 * k, aux_coeff=1 / 32)
+        sae = SparseAutoencoder(cfg)
+        history = train_sae(
+            sae, loader, n_training_tokens=5 * 128, resample_interval=3,
+            log_interval=1, device="cpu", calibration_tokens=256,
+        )
+        assert history["step"] == [1, 2, 3, 4, 5]
+        assert all(np.isfinite(history["loss"]))
+        assert all(l0 <= k for l0 in history["l0"])
         assert loader.tokens_yielded == 5 * 128
 
 

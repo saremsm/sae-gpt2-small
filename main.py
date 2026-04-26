@@ -110,6 +110,29 @@ def parse_args() -> argparse.Namespace:
         help="run the GPT-2 forward in fp32 instead of bf16 autocast (CUDA)",
     )
     parser.add_argument(
+        "--activation", choices=["relu", "topk"], default="relu",
+        help="encoder nonlinearity (README, variants): relu = ReLU + L1 "
+        "penalty (l1_coefficient=5e-3, the numbers-table recipe); topk = "
+        "keep the --k largest pre-activations per token, MSE-only loss "
+        "(Gao et al. 2024), L1 off",
+    )
+    parser.add_argument(
+        "--k", type=int, default=32,
+        help="latents kept per token under --activation topk (ignored "
+        "under relu)",
+    )
+    parser.add_argument(
+        "--aux-k", type=int, default=0,
+        help="AuxK (topk only): reconstruct the residual error from the "
+        "top-aux-k pre-activations among currently dead features and add "
+        "--aux-coeff x that MSE to the loss; 0 = off (default). Gao et al. "
+        "use 2k with coefficient 1/32",
+    )
+    parser.add_argument(
+        "--aux-coeff", type=float, default=0.0,
+        help="weight of the AuxK term (0.03125 = 1/32 in the paper)",
+    )
+    parser.add_argument(
         "--forward", choices=["tl", "hf"], default="hf",
         help="GPT-2 implementation the activation loader runs (analysis "
         "always uses TransformerLens): tl = HookedTransformer, hf = "
@@ -160,7 +183,13 @@ def plot_training_history(history: dict, save_path: str = "training_history.png"
             fontsize=9,
         )
 
-    axes[1, 2].set_visible(False)
+    if history.get("aux_loss") and any(v > 0 for v in history["aux_loss"]):
+        axes[1, 2].plot(steps, history["aux_loss"])
+        axes[1, 2].set_title("AuxK loss (unweighted MSE, scaled space)")
+        axes[1, 2].set_xlabel("Step")
+        axes[1, 2].set_ylabel("MSE")
+    else:
+        axes[1, 2].set_visible(False)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
@@ -225,13 +254,24 @@ def main() -> None:
     warmup_steps = max(10, WARMUP_TOKENS // args.batch_tokens)
     resample_interval = max(1, RESAMPLE_TOKENS // args.batch_tokens)
     log_interval = max(1, LOG_TOKENS // args.batch_tokens)
+    # topk: MSE-only loss, so the L1 coefficient is 0.
+    is_topk = args.activation == "topk"
     config = SAEConfig(
         d_model=model.cfg.d_model,
         n_features=3072,
-        l1_coefficient=5e-3,
+        l1_coefficient=0.0 if is_topk else 5e-3,
         lr=2e-4,
         warmup_steps=warmup_steps,
+        activation=args.activation,
+        k=args.k if is_topk else None,
+        aux_k=args.aux_k if is_topk else 0,
+        aux_coeff=args.aux_coeff if is_topk else 0.0,
     )
+    if not is_topk and (args.aux_k or args.aux_coeff):
+        print(
+            "NOTE: --aux-k / --aux-coeff only apply with --activation topk; "
+            "ignored."
+        )
     print(
         f"Schedule: batch_tokens={args.batch_tokens}, warmup {warmup_steps} steps "
         f"({WARMUP_TOKENS:,} tok), resample every {resample_interval} steps "
@@ -344,6 +384,9 @@ def main() -> None:
             "steps": history["step"][-1] if history["step"] else 0,
             "final_loss": history["loss"][-1] if history["loss"] else None,
             "final_l0": history["l0"][-1] if history["l0"] else None,
+            "final_aux_loss": (
+                history["aux_loss"][-1] if history["aux_loss"] else None
+            ),
             "final_dead_features": (
                 history["dead_features"][-1] if history["dead_features"] else None
             ),
