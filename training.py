@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import time
 from collections import deque
+from pathlib import Path
 from typing import Iterator, Protocol, TypedDict, runtime_checkable
 
 import torch
@@ -74,6 +77,7 @@ def train_sae(
     device: str = "cpu",
     seed: int = 42,
     calibration_tokens: int = 100_000,
+    log_jsonl: str | Path | None = None,
 ) -> TrainingHistory:
     """Train `sae` on raw residual batches from `loader`."""
     torch.manual_seed(seed)
@@ -82,7 +86,10 @@ def train_sae(
     sae = sae.to(device)
     sae.train()
 
-    optimizer = AdamW(sae.parameters(), lr=sae.config.lr, weight_decay=0.0)
+    optimizer = AdamW(
+        sae.parameters(), lr=sae.config.lr, betas=sae.config.adam_betas,
+        weight_decay=0.0,
+    )
 
     # Guard a silent failure: the original warmup_steps=1000 vs ~976-step run
     batch_tokens = loader.batch_tokens
@@ -168,7 +175,7 @@ def train_sae(
         )
     print(
         f"  LR schedule   : {sae.config.lr} with "
-        f"{warmup_steps}-step warmup"
+        f"{warmup_steps}-step warmup (AdamW betas={sae.config.adam_betas})"
     )
     print(f"  Target tokens : {n_training_tokens:,} ({batch_tokens} per step)")
     calib_note = (
@@ -191,6 +198,12 @@ def train_sae(
     step = 0
     tokens_trained = 0
     pbar = tqdm(total=n_training_tokens, unit="tok")
+    t_start = time.perf_counter()
+
+    log_file = None
+    if log_jsonl is not None:
+        Path(log_jsonl).parent.mkdir(parents=True, exist_ok=True)
+        log_file = open(log_jsonl, "w")
 
     batch_iter = batches()
     while tokens_trained < n_training_tokens:
@@ -244,6 +257,21 @@ def train_sae(
             history["l0"].append(output.l0.item())
             history["dead_features"].append(n_dead)
             history["act_norm"].append(act_norm)
+            if log_file is not None:
+                log_file.write(json.dumps({
+                    "step": step,
+                    "tokens": tokens_trained,
+                    "loss": output.loss.item(),
+                    "reconstruction_loss": output.reconstruction_loss.item(),
+                    "sparsity_loss": output.sparsity_loss.item(),
+                    "aux_loss": output.aux_loss.item(),
+                    "l0": output.l0.item(),
+                    "dead_features": n_dead,
+                    "act_norm": act_norm,
+                    "lr": current_lr,
+                    "elapsed_s": time.perf_counter() - t_start,
+                }) + "\n")
+                log_file.flush()
             pbar.set_postfix(
                 {
                     "loss": f"{output.loss.item():.3f}",
@@ -255,6 +283,8 @@ def train_sae(
             )
 
     pbar.close()
+    if log_file is not None:
+        log_file.close()
     if tokens_trained < n_training_tokens:
         print(
             f"WARNING: loader ended after {tokens_trained:,} tokens "

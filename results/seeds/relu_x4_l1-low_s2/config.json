@@ -1,0 +1,63 @@
+{
+  "run": "relu_x4_l1-low_s2",
+  "sae": {
+    "d_model": 768,
+    "n_features": 3072,
+    "l1_coefficient": 0.0025,
+    "lr": 0.0004,
+    "warmup_steps": 1000,
+    "normalize_decoder": true,
+    "normalize_input": true,
+    "activation": "relu",
+    "k": null,
+    "aux_k": 0,
+    "aux_coeff": 0.0,
+    "adam_betas": [
+      0.9,
+      0.99
+    ]
+  },
+  "layer": 8,
+  "hook_name": "blocks.8.hook_resid_post",
+  "device": "cuda",
+  "args": {
+    "config_json": "results/seeds/relu_x4_l1-low_s2/sweep_entry.json",
+    "train_shard": "data/train.bin",
+    "holdout_shard": "data/holdout.bin",
+    "n_tokens": 200000000,
+    "batch_seqs": 256,
+    "batch_tokens": 4096,
+    "buffer_tokens": 1000000,
+    "calibration_tokens": 100000,
+    "eval_tokens": 2000000,
+    "eval_batch_seqs": 64,
+    "run_name": "relu_x4_l1-low_s2",
+    "results_dir": "results/seeds",
+    "seed": 2,
+    "device": null,
+    "checkpoint": "results/seeds/relu_x4_l1-low_s2/checkpoint.pt",
+    "no_analysis": true,
+    "no_autocast": false,
+    "activation": "relu",
+    "k": 32,
+    "l1_coeff": 0.0025,
+    "expansion": 4,
+    "lr": 0.0004,
+    "adam_betas": [
+      0.9,
+      0.99
+    ],
+    "warmup_steps": 1000,
+    "resample_interval": 5000,
+    "log_interval": null,
+    "aux_k": 0,
+    "aux_coeff": 0.0,
+    "forward": "hf"
+  },
+  "schedule": {
+    "warmup_steps": 1000,
+    "resample_interval": 5000,
+    "log_interval": 6
+  },
+  "started_at": "2026-05-09T20:16:49+00:00"
+}

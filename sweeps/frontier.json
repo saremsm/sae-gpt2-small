@@ -1,0 +1,334 @@
+{
+    "_notes": [
+        "Frontier sweep: 18 runs, 200M tokens each at batch 4096 (48,828 optimizer steps), lr 4e-4 after a 1000-step warmup, AdamW betas (0.9, 0.99), seed 42, resample_interval 5000 steps (20.5M tokens; fires 9 times per run, >= 6 by design and a wide enough window that only truly dead features are resampled).",
+        "L1 coefficients (scaled space, mean token norm sqrt(768)): l1_coeff=5e-3 is the numbers-table recipe and gave L0 28.6 at 500K tokens / lr 2e-4 (README, 500K-token run). In this regime L0 moves roughly inversely with the coefficient (8e-4 -> 866 pre-scaling; 5e-3 -> 17-43 across contracts) and longer training lets the penalty bite a little harder, so mid = 5e-3 targets L0 ~25, low = 2.5e-3 targets ~50-60, high = 1e-2 targets ~12-18: the three bracket L0 15-60. Edit the three values in each relu_* entry to move the bracket.",
+        "TopK: k in {16, 32, 64} sets L0 directly; AuxK at the Gao et al. defaults (aux_k = 2k, aux_coeff = 1/32) because dead latents are the documented TopK failure mode at 8x / 16x widths and this many tokens - delete aux_k / aux_coeff from an entry for pure TopK.",
+        "expansion x 768 = features: 4 -> 3072, 8 -> 6144, 16 -> 12288.",
+        "Any other main.py flag can be added per entry (see main.py --config-json); `python sweep.py sweeps/frontier.json --results results/` then `python plot.py --results results/ --out figures/`."
+    ],
+    "runs": [{
+            "name": "relu_x4_l1-low",
+            "activation": "relu",
+            "l1_coeff": 0.0025,
+            "expansion": 4,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "relu_x4_l1-mid",
+            "activation": "relu",
+            "l1_coeff": 0.005,
+            "expansion": 4,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "relu_x4_l1-high",
+            "activation": "relu",
+            "l1_coeff": 0.01,
+            "expansion": 4,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "topk_x4_k16",
+            "activation": "topk",
+            "k": 16,
+            "expansion": 4,
+            "aux_k": 32,
+            "aux_coeff": 0.03125,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "topk_x4_k32",
+            "activation": "topk",
+            "k": 32,
+            "expansion": 4,
+            "aux_k": 64,
+            "aux_coeff": 0.03125,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "topk_x4_k64",
+            "activation": "topk",
+            "k": 64,
+            "expansion": 4,
+            "aux_k": 128,
+            "aux_coeff": 0.03125,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "relu_x8_l1-low",
+            "activation": "relu",
+            "l1_coeff": 0.0025,
+            "expansion": 8,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "relu_x8_l1-mid",
+            "activation": "relu",
+            "l1_coeff": 0.005,
+            "expansion": 8,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "relu_x8_l1-high",
+            "activation": "relu",
+            "l1_coeff": 0.01,
+            "expansion": 8,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "topk_x8_k16",
+            "activation": "topk",
+            "k": 16,
+            "expansion": 8,
+            "aux_k": 32,
+            "aux_coeff": 0.03125,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "topk_x8_k32",
+            "activation": "topk",
+            "k": 32,
+            "expansion": 8,
+            "aux_k": 64,
+            "aux_coeff": 0.03125,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "topk_x8_k64",
+            "activation": "topk",
+            "k": 64,
+            "expansion": 8,
+            "aux_k": 128,
+            "aux_coeff": 0.03125,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "relu_x16_l1-low",
+            "activation": "relu",
+            "l1_coeff": 0.0025,
+            "expansion": 16,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "relu_x16_l1-mid",
+            "activation": "relu",
+            "l1_coeff": 0.005,
+            "expansion": 16,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "relu_x16_l1-high",
+            "activation": "relu",
+            "l1_coeff": 0.01,
+            "expansion": 16,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "topk_x16_k16",
+            "activation": "topk",
+            "k": 16,
+            "expansion": 16,
+            "aux_k": 32,
+            "aux_coeff": 0.03125,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "topk_x16_k32",
+            "activation": "topk",
+            "k": 32,
+            "expansion": 16,
+            "aux_k": 64,
+            "aux_coeff": 0.03125,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "topk_x16_k64",
+            "activation": "topk",
+            "k": 64,
+            "expansion": 16,
+            "aux_k": 128,
+            "aux_coeff": 0.03125,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        }
+    ]
+}

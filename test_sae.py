@@ -1703,3 +1703,488 @@ class TestRunRecord:
         with pytest.raises(ValueError, match="overlaps"):
             eval_mod.main(["--checkpoint", str(ckpt), "--holdout", str(overlap.path),
                            "--n-tokens", "500", "--batch-seqs", "8", "--device", "cpu"])
+
+# config-json / sweep runner / frontier plots
+
+
+STUB_TRAINER = '''\
+"""stand-in for main.py in the sweep tests: reads --config-json, records
+the call, writes results/<run>/metrics.json (or fails on demand)."""
+import argparse, json, os, sys
+p = argparse.ArgumentParser()
+p.add_argument("--config-json", required=True)
+a = p.parse_args()
+cfg = json.load(open(a.config_json))
+run_dir = os.path.join(cfg["results_dir"], cfg["run_name"])
+os.makedirs(run_dir, exist_ok=True)
+with open(os.path.join(cfg["results_dir"], "calls.txt"), "a") as f:
+    f.write(cfg["run_name"] + "\\n")
+print("stub trainer running", cfg["run_name"], "device", os.environ.get("CUDA_VISIBLE_DEVICES"))
+if cfg["run_name"].startswith("fail"):
+    print("stub trainer: failing on purpose", file=sys.stderr)
+    sys.exit(3)
+n_features = int(round(cfg.get("expansion", 4) * 768))
+metrics = {"fvu": 0.4, "variance_explained": 0.6, "l0": cfg.get("k", 30),
+           "loss_recovered": 0.9, "ce_clean": 3.9, "ce_recon": 4.6, "ce_zero": 13.8,
+           "dead_frac_eval": 0.0, "n_tokens": cfg["n_tokens"]}
+json.dump({"run": cfg["run_name"], "metrics": metrics,
+           "config": {"sae": {"d_model": 768, "n_features": n_features,
+                              "activation": cfg.get("activation", "relu"),
+                              "k": cfg.get("k"), "l1_coefficient": cfg.get("l1_coeff", 5e-3)},
+                      "args": cfg},
+           "training": {"tokens": cfg["n_tokens"], "loader_tok_s": 1000.0,
+                        "train_wall_seconds": 6.0}},
+          open(os.path.join(run_dir, "metrics.json"), "w"))
+'''
+
+
+def _fake_metrics_record(name, activation, expansion, l0, ve, lr, k=None, l1=5e-3,
+                         n_tokens=200_000_000, metrics=True) -> dict:
+    """a main.py-shaped metrics.json record for plot.py (only the keys plot.py
+    reads; None metrics = evaluation skipped)."""
+    n_features = expansion * 768
+    m = None
+    if metrics:
+        m = {"fvu": 1 - ve, "variance_explained": ve, "l0": l0, "loss_recovered": lr,
+             "ce_clean": 3.86, "ce_recon": 3.86 + (1 - lr) * 10, "ce_zero": 13.86,
+             "dead_frac_eval": 0.01, "n_tokens": 2_000_000}
+    return {"run": name, "metrics": m,
+            "config": {"sae": {"d_model": 768, "n_features": n_features,
+                               "activation": activation, "k": k,
+                               "l1_coefficient": 0.0 if activation == "topk" else l1},
+                       "args": {"n_tokens": n_tokens, "expansion": expansion}},
+            "training": {"tokens": n_tokens, "loader_tok_s": 95_000.0,
+                         "train_wall_seconds": 3600.0}}
+
+
+class TestSAEConfigBetas:
+    def test_default_and_coercion(self):
+        assert SAEConfig(d_model=8, n_features=16).adam_betas == (0.9, 0.999)
+        cfg = SAEConfig(d_model=8, n_features=16, adam_betas=[0.9, 0.99])
+        assert cfg.adam_betas == (0.9, 0.99) and isinstance(cfg.adam_betas, tuple)
+        for bad in ((0.9,), (0.9, 1.0), (-0.1, 0.99)):
+            with pytest.raises(ValueError, match="adam_betas"):
+                SAEConfig(d_model=8, n_features=16, adam_betas=bad)
+
+    def test_train_sae_passes_betas_to_adamw(self, monkeypatch):
+        """train_sae builds AdamW with config.adam_betas (the sweep's (0.9, 0.99)
+        reaches the optimizer, not torch's default)."""
+        import training
+
+        seen = {}
+        real = training.AdamW
+
+        def spy(params, **kw):
+            seen.update(kw)
+            return real(params, **kw)
+
+        monkeypatch.setattr(training, "AdamW", spy)
+        d = 16
+        cfg = SAEConfig(d_model=d, n_features=32, l1_coefficient=1e-3, warmup_steps=2,
+                        adam_betas=(0.9, 0.99))
+        src = TestTrainSaeCalibration._SyntheticSource(d=d, batch_tokens=256, n_chunks=4,
+                                                       scale=37.0)
+        training.train_sae(SparseAutoencoder(cfg), src, n_training_tokens=512,
+                           resample_interval=1000, log_interval=1, device="cpu",
+                           calibration_tokens=256)
+        assert seen["betas"] == (0.9, 0.99) and seen["lr"] == cfg.lr
+
+
+class TestTrainLogJsonl:
+    def test_one_line_per_logged_step_matches_history(self, tmp_path):
+        """log_jsonl gets one JSON line per history row with the history values plus
+        tokens / lr / elapsed_s; the parent dir is created."""
+        from training import train_sae
+
+        d = 16
+        cfg = SAEConfig(d_model=d, n_features=32, l1_coefficient=1e-3, warmup_steps=2)
+        src = TestTrainSaeCalibration._SyntheticSource(d=d, batch_tokens=128, n_chunks=8,
+                                                       scale=37.0)
+        path = tmp_path / "r" / "train_log.jsonl"
+        history = train_sae(SparseAutoencoder(cfg), src, n_training_tokens=1024,
+                            resample_interval=1000, log_interval=2, device="cpu",
+                            calibration_tokens=256, log_jsonl=path)
+        rows = [json.loads(l) for l in path.read_text().splitlines()]
+        assert [r["step"] for r in rows] == history["step"] == [2, 4, 6, 8]
+        assert [r["loss"] for r in rows] == history["loss"]
+        assert [r["l0"] for r in rows] == history["l0"]
+        assert rows[-1]["tokens"] == 1024 and rows[-1]["lr"] == cfg.lr
+        assert all(set(r) >= {"step", "tokens", "loss", "reconstruction_loss",
+                              "sparsity_loss", "aux_loss", "l0", "dead_features",
+                              "act_norm", "lr", "elapsed_s"} for r in rows)
+
+
+class TestMainConfigJson:
+    def test_precedence_cli_over_json_over_default(self, tmp_path):
+        """--config-json values replace defaults; an explicit flag beats the JSON;
+        `name` / `betas` aliases and '_' comment keys work; string values go
+        through the flag's type."""
+        import main
+
+        cfg = tmp_path / "c.json"
+        cfg.write_text(json.dumps({
+            "_comment": "ignored", "name": "runA", "activation": "topk", "k": 16,
+            "expansion": 8, "lr": "4e-4", "betas": [0.9, 0.99], "n_tokens": 2000,
+            "batch_tokens": 4096, "resample_interval": 5000, "warmup_steps": 1000,
+        }))
+        args = main.parse_args(["--config-json", str(cfg), "--k", "64"])
+        assert args.run_name == "runA" and args.activation == "topk"
+        assert args.k == 64 and args.expansion == 8 and args.lr == 4e-4
+        assert args.adam_betas == (0.9, 0.99) and args.n_tokens == 2000
+        assert args.batch_tokens == 4096
+        # untouched defaults survive
+        assert args.forward == "hf" and args.eval_tokens == 2_000_000
+        # and the plain CLI still works with defaults
+        d = main.parse_args([])
+        assert d.expansion == 4.0 and d.lr == 2e-4 and d.adam_betas == (0.9, 0.999)
+        assert d.checkpoint == main.DEFAULT_CHECKPOINT and d.warmup_steps is None
+
+    def test_unknown_key_and_bad_choice_raise(self, tmp_path):
+        import main
+
+        cfg = tmp_path / "c.json"
+        cfg.write_text(json.dumps({"l1_coef": 1e-3}))
+        with pytest.raises(SystemExit, match="unknown key 'l1_coef'"):
+            main.parse_args(["--config-json", str(cfg)])
+        cfg.write_text(json.dumps({"activation": "jumprelu"}))
+        with pytest.raises(SystemExit, match="jumprelu"):
+            main.parse_args(["--config-json", str(cfg)])
+        cfg.write_text(json.dumps([1, 2]))
+        with pytest.raises(SystemExit, match="JSON object"):
+            main.parse_args(["--config-json", str(cfg)])
+
+    def test_sae_config_and_schedule_from_args(self, tmp_path):
+        """expansion -> n_features, l1_coeff / k / betas / lr into the SAEConfig,
+        topk zeroes L1, relu drops k and AuxK; token-denominated schedule
+        defaults vs explicit overrides."""
+        import main
+
+        a = main.parse_args(["--activation", "relu", "--l1-coeff", "2.5e-3",
+                             "--expansion", "16", "--lr", "4e-4", "--adam-betas", "0.9",
+                             "0.99", "--aux-k", "8", "--batch-tokens", "4096"])
+        cfg = main.sae_config_from_args(a, 768)
+        assert cfg.n_features == 12288 and cfg.l1_coefficient == 2.5e-3
+        assert cfg.k is None and cfg.aux_k == 0 and cfg.lr == 4e-4
+        assert cfg.adam_betas == (0.9, 0.99)
+        sched = main.schedule_from_args(a)
+        assert sched == {"warmup_steps": max(10, main.WARMUP_TOKENS // 4096),
+                         "resample_interval": main.RESAMPLE_TOKENS // 4096,
+                         "log_interval": main.LOG_TOKENS // 4096}
+        assert cfg.warmup_steps == sched["warmup_steps"]
+
+        b = main.parse_args(["--activation", "topk", "--k", "16", "--aux-k", "32",
+                             "--aux-coeff", "0.03125", "--l1-coeff", "9", "--expansion",
+                             "8", "--warmup-steps", "1000", "--resample-interval", "5000"])
+        cfg = main.sae_config_from_args(b, 768)
+        assert cfg.n_features == 6144 and cfg.activation == "topk" and cfg.k == 16
+        assert cfg.l1_coefficient == 0.0 and cfg.aux_k == 32 and cfg.warmup_steps == 1000
+        assert main.schedule_from_args(b)["resample_interval"] == 5000
+        with pytest.raises(SystemExit):
+            main.parse_args(["--expansion", "0"])
+        c = main.parse_args(["--log-interval", "2", "--warmup-steps", "0"])
+        with pytest.raises(SystemExit, match="must be >= 1"):
+            main.schedule_from_args(c)
+        assert main.schedule_from_args(main.parse_args(["--log-interval", "2"]))["log_interval"] == 2
+
+
+class TestMainInProcess:
+    def test_main_writes_run_dir_layout(self, tmp_path, tiny_model, loader_shard, monkeypatch):
+        """main.main end to end on the hermetic tiny model (its from_pretrained /
+        load_forward_model / TARGET_LAYER monkeypatched) with a --config-json."""
+        import main
+
+        monkeypatch.setattr(main.HookedTransformer, "from_pretrained",
+                            classmethod(lambda cls, *a, **k: tiny_model))
+        monkeypatch.setattr(main, "load_forward_model", lambda backend, device: tiny_model)
+        monkeypatch.setattr(main, "TARGET_LAYER", 1)
+        results = tmp_path / "results"
+        cfg = tmp_path / "c.json"
+        cfg.write_text(json.dumps({
+            "name": "tiny_topk", "activation": "topk", "k": 8, "aux_k": 16,
+            "aux_coeff": 0.03125, "expansion": 4, "n_tokens": 2000, "lr": 4e-4,
+            "betas": [0.9, 0.99], "batch_tokens": 128, "buffer_tokens": 512,
+            "batch_seqs": 8, "calibration_tokens": 256, "eval_tokens": 500,
+            "eval_batch_seqs": 8, "warmup_steps": 2, "resample_interval": 4,
+            "log_interval": 2, "device": "cpu", "no_analysis": True,
+            "train_shard": str(loader_shard.path), "holdout_shard": str(loader_shard.path),
+            "results_dir": str(results), "checkpoint": str(results / "tiny_topk" / "checkpoint.pt"),
+        }))
+        main.main(["--config-json", str(cfg)])
+        d = results / "tiny_topk"
+        for f in ("config.json", "train_log.jsonl", "training_history.png", "metrics.json",
+                  "checkpoint.pt"):
+            assert (d / f).exists(), f
+        record = json.load(open(d / "metrics.json"))
+        assert record["run"] == "tiny_topk" and record["checkpoint"] == str(d / "checkpoint.pt")
+        assert record["config"]["sae"]["n_features"] == 4 * tiny_model.cfg.d_model
+        assert record["config"]["sae"]["k"] == 8 and record["config"]["sae"]["lr"] == 4e-4
+        assert record["config"]["sae"]["adam_betas"] == [0.9, 0.99]
+        assert record["config"]["schedule"] == {"warmup_steps": 2, "resample_interval": 4,
+                                                "log_interval": 2}
+        assert record["config"]["args"]["expansion"] == 4
+        assert record["metrics"]["l0"] <= 8 and record["metrics"]["n_tokens"] == 3 * 248
+        assert record["training"]["tokens"] == 16 * 128 and record["training"]["steps"] == 16
+        rows = [json.loads(l) for l in open(d / "train_log.jsonl")]
+        assert [r["step"] for r in rows] == list(range(2, 17, 2))
+        run_cfg = json.load(open(d / "config.json"))
+        assert run_cfg["run"] == "tiny_topk" and run_cfg["hook_name"] == "blocks.1.hook_resid_post"
+        from eval import load_checkpoint
+
+        sae, ckpt = load_checkpoint(str(d / "checkpoint.pt"), "cpu")
+        assert sae.config.k == 8 and sae.config.adam_betas == (0.9, 0.99)
+        assert sae.config.n_features == 4 * tiny_model.cfg.d_model
+        assert ckpt["layer"] == 1 and sae.input_scale.item() != 1.0
+
+
+class TestSweep:
+    """sweep.py orchestration against a stub trainer."""
+
+    @pytest.fixture
+    def stub(self, tmp_path):
+        path = tmp_path / "stub_trainer.py"
+        path.write_text(STUB_TRAINER)
+        return str(path)
+
+    def _calls(self, results) -> list[str]:
+        p = os.path.join(results, "calls.txt")
+        return open(p).read().split() if os.path.exists(p) else []
+
+    def _index(self, results) -> list[dict]:
+        return [json.loads(l) for l in open(os.path.join(results, "index.jsonl"))]
+
+    def test_load_sweep_shapes_and_validation(self, tmp_path):
+        from sweep import load_sweep, parse_set
+
+        lst = tmp_path / "l.json"
+        lst.write_text(json.dumps([{"name": "a", "k": 1, "_why": "x"}, {"name": "b"}]))
+        assert load_sweep(lst) == [{"name": "a", "k": 1}, {"name": "b"}]
+        obj = tmp_path / "o.json"
+        obj.write_text(json.dumps({"_notes": ["hi"], "runs": [{"name": "a"}]}))
+        assert load_sweep(obj) == [{"name": "a"}]
+        for bad in ([{"name": "a"}, {"name": "a"}], [{"name": "no/slash"}], [{"k": 1}],
+                    {"nope": []}, "str"):
+            (tmp_path / "bad.json").write_text(json.dumps(bad))
+            with pytest.raises(ValueError):
+                load_sweep(tmp_path / "bad.json")
+        assert parse_set(["n_tokens=2000", "lr=4e-4", "activation=topk", "x=true"]) == {
+            "n_tokens": 2000, "lr": 4e-4, "activation": "topk", "x": True}
+        with pytest.raises(ValueError):
+            parse_set(["novalue"])
+
+    def test_repo_sweep_files_load_and_resolve(self, tmp_path):
+        """sweeps/frontier.json is the 18-run frontier (3 L1 x 3 k x 3 widths, 200M
+        tokens, batch 4096, resample >= 6 times) and sweeps/smoke.json two
+        200K-token runs; every entry key is a main.py --config-json key."""
+        import main
+        from sweep import load_sweep, resolve_entry
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        frontier = load_sweep(os.path.join(here, "sweeps", "frontier.json"))
+        smoke = load_sweep(os.path.join(here, "sweeps", "smoke.json"))
+        assert len(frontier) == 18 and len(smoke) == 2
+        relu = [e for e in frontier if e["activation"] == "relu"]
+        topk = [e for e in frontier if e["activation"] == "topk"]
+        assert len(relu) == 9 and len(topk) == 9
+        assert sorted({e["k"] for e in topk}) == [16, 32, 64]
+        assert len({e["l1_coeff"] for e in relu}) == 3
+        assert sorted({e["expansion"] for e in frontier}) == [4, 8, 16]
+        for e in frontier:
+            assert e["n_tokens"] == 200_000_000 and e["batch_tokens"] == 4096
+            assert e["lr"] == 4e-4 and e["betas"] == [0.9, 0.99]
+            steps = e["n_tokens"] // e["batch_tokens"]
+            assert steps // e["resample_interval"] >= 6
+        for e in smoke:
+            assert e["n_tokens"] == 200_000
+        parser = main.build_parser()
+        for e in frontier + smoke:
+            cfg = resolve_entry(e, "results", shard="s.bin", holdout="h.bin")
+            assert cfg["run_name"] == e["name"] and cfg["no_analysis"] is True
+            assert cfg["checkpoint"] == os.path.join("results", e["name"], "checkpoint.pt")
+            path = tmp_path / "entry.json"
+            path.write_text(json.dumps(cfg))
+            main.load_config_json(str(path), parser)  # unknown key -> SystemExit
+
+    def test_runs_index_skip_force_and_failure(self, tmp_path, stub):
+        import sweep
+
+        results = str(tmp_path / "r")
+        entries = [{"name": "a", "n_tokens": 5000, "activation": "topk", "k": 16},
+                   {"name": "fail_b", "n_tokens": 5000},
+                   {"name": "c", "n_tokens": 5000, "expansion": 8}]
+        sw = tmp_path / "s.json"
+        sw.write_text(json.dumps(entries))
+
+        rc = sweep.main([str(sw), "--results", results, "--trainer", stub,
+                         "--set", "n_tokens=2000", "--shard", "/x/train.bin"])
+        assert rc == 1  # one failure -> non-zero, but the sweep went on
+        idx = self._index(results)
+        assert [l["name"] for l in idx] == ["a", "fail_b", "c"]
+        assert [l["status"] for l in idx] == ["ok", "failed", "ok"]
+        assert idx[1]["returncode"] == 3 and "failing on purpose" in idx[1]["log_tail"]
+        assert idx[0]["l0"] == 16 and idx[0]["fvu"] == 0.4 and idx[0]["wall_min"] >= 0
+        assert self._calls(results) == ["a", "fail_b", "c"]
+        for name in ("a", "c"):
+            d = tmp_path / "r" / name
+            assert (d / "metrics.json").exists() and (d / "train.log").exists()
+            entry = json.load(open(d / "sweep_entry.json"))
+            assert entry["n_tokens"] == 2000  # --set wins over the entry
+            assert entry["train_shard"] == "/x/train.bin"
+            assert entry["run_name"] == name and entry["no_analysis"] is True
+            assert entry["checkpoint"] == os.path.join(results, name, "checkpoint.pt")
+        assert not (tmp_path / "r" / "fail_b" / "metrics.json").exists()
+
+        # second pass: a and c are skipped (trainer not called)
+        rc = sweep.main([str(sw), "--results", results, "--trainer", stub])
+        assert rc == 1
+        idx = self._index(results)
+        assert [l["status"] for l in idx[3:]] == ["skipped", "failed", "skipped"]
+        assert self._calls(results) == ["a", "fail_b", "c", "fail_b"]
+
+        # --force re-runs everything.
+        sweep.main([str(sw), "--results", results, "--trainer", stub, "--force"])
+        assert self._calls(results) == ["a", "fail_b", "c", "fail_b", "a", "fail_b", "c"]
+        assert [l["status"] for l in self._index(results)[6:]] == ["ok", "failed", "ok"]
+
+    def test_parallel_and_gpu_pinning(self, tmp_path, stub):
+        import sweep
+
+        results = str(tmp_path / "r")
+        entries = [{"name": f"p{i}", "n_tokens": 10} for i in range(4)]
+        lines = sweep.run_sweep(entries, results, trainer=stub, parallel=2,
+                                gpus=["0", "1"])
+        assert [l["status"] for l in lines] == ["ok"] * 4
+        assert sorted(self._calls(results)) == ["p0", "p1", "p2", "p3"]
+        assert {l["gpu"] for l in lines} <= {"0", "1"}
+        for l in lines:
+            log = open(l["log"]).read()
+            assert f"device {l['gpu']}" in log
+        assert len(self._index(results)) == 4
+
+    def test_dry_run_writes_nothing(self, tmp_path, stub, capsys):
+        import sweep
+
+        results = str(tmp_path / "r")
+        sw = tmp_path / "s.json"
+        sw.write_text(json.dumps([{"name": "a", "n_tokens": 10}]))
+        assert sweep.main([str(sw), "--results", results, "--trainer", stub,
+                           "--dry-run"]) == 0
+        assert not os.path.exists(results)
+        out = capsys.readouterr().out
+        assert "--config-json" in out and stub in out
+
+
+class TestSweepEndToEnd:
+    def test_smoke_sweep_real_main_on_cpu(self, tmp_path, gpt2_model, loader_shard):
+        """`python sweep.py sweeps/smoke.json` through the REAL main.py."""
+        import plot
+        import sweep
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        results = str(tmp_path / "r")
+        rc = sweep.main([
+            os.path.join(here, "sweeps", "smoke.json"), "--results", results,
+            "--trainer", os.path.join(here, "main.py"),
+            "--shard", str(loader_shard.path), "--holdout", str(loader_shard.path),
+            "--set", "n_tokens=2000", "--set", "batch_tokens=128",
+            "--set", "buffer_tokens=512", "--set", "batch_seqs=8",
+            "--set", "calibration_tokens=256", "--set", "eval_tokens=500",
+            "--set", "eval_batch_seqs=8", "--set", "warmup_steps=2",
+            "--set", "resample_interval=4", "--set", "log_interval=2",
+            "--set", "device=cpu",
+        ])
+        idx = [json.loads(l) for l in open(os.path.join(results, "index.jsonl"))]
+        assert rc == 0, [(l["name"], l.get("error"), l.get("log_tail")) for l in idx]
+        assert [l["status"] for l in idx] == ["ok", "ok"]
+        for name in ("smoke_relu_x4", "smoke_topk_x4_k32"):
+            d = tmp_path / "r" / name
+            for f in ("checkpoint.pt", "metrics.json", "train_log.jsonl", "config.json",
+                      "training_history.png", "sweep_entry.json", "train.log"):
+                assert (d / f).exists(), f
+            record = json.load(open(d / "metrics.json"))
+            # eval stops at the first batch that reaches 500 tokens: 3 x 8 rows x 31
+            assert record["run"] == name and record["metrics"]["n_tokens"] == 3 * 248
+            assert record["config"]["sae"]["n_features"] == 3072
+            assert record["config"]["sae"]["adam_betas"] == [0.9, 0.99]
+            assert record["config"]["args"]["lr"] == 4e-4
+            assert record["checkpoint"] == str(d / "checkpoint.pt")
+            rows = [json.loads(l) for l in open(d / "train_log.jsonl")]
+            # 2000 tokens at batch 128 = 16 steps, logged every 2
+            assert [r["step"] for r in rows] == list(range(2, 17, 2))
+            assert rows[-1]["tokens"] == 16 * 128
+            cfg = json.load(open(d / "config.json"))
+            assert cfg["run"] == name and cfg["schedule"] == {
+                "warmup_steps": 2, "resample_interval": 4, "log_interval": 2}
+        topk = json.load(open(tmp_path / "r" / "smoke_topk_x4_k32" / "metrics.json"))
+        assert topk["config"]["sae"]["k"] == 32 and topk["metrics"]["l0"] <= 32
+        plot.main(["--results", results, "--out", str(tmp_path / "f")])
+        assert (tmp_path / "f" / "frontier.png").exists()
+        assert "smoke_topk_x4_k32" in (tmp_path / "f" / "tables.md").read_text()
+
+
+class TestPlot:
+    RUNS = [
+        # name, activation, expansion, l0, 1-fvu, loss_recovered, k
+        ("relu_x4_lo", "relu", 4, 55.0, 0.70, 0.90, None),
+        ("relu_x4_hi", "relu", 4, 18.0, 0.55, 0.80, None),
+        ("topk_x4_k32", "topk", 4, 32.0, 0.68, 0.94, 32),
+        ("topk_x4_k64", "topk", 4, 64.0, 0.78, 0.97, 64),
+        ("topk_x8_k16", "topk", 8, 16.0, 0.60, 0.88, 16),
+        ("relu_x8_mid", "relu", 8, 30.0, 0.66, 0.91, None),
+        ("relu_x8_lo", "relu", 8, 39.5, 0.69, 0.90, None),
+    ]
+
+    @pytest.fixture
+    def results(self, tmp_path):
+        from eval import write_json
+
+        for name, act, exp, l0, ve, lr, k in self.RUNS:
+            write_json(tmp_path / "results" / name / "metrics.json",
+                       _fake_metrics_record(name, act, exp, l0, ve, lr, k=k))
+        write_json(tmp_path / "results" / "no_eval" / "metrics.json",
+                   _fake_metrics_record("no_eval", "relu", 4, 0, 0, 0, metrics=False))
+        return tmp_path / "results"
+
+    def test_load_and_best_per_width(self, results):
+        from plot import best_per_width, load_runs
+
+        rows, unevaluated = load_runs(results)
+        assert unevaluated == ["no_eval"] and len(rows) == 7
+        by = {r.name: r for r in rows}
+        assert by["topk_x4_k32"].sparsity_param == "k=32"
+        assert by["relu_x4_lo"].sparsity_param == "λ=0.005"
+        assert by["topk_x8_k16"].expansion == 8 and by["topk_x8_k16"].n_features == 6144
+        assert by["relu_x4_lo"].wall_min == 60.0 and by["relu_x4_lo"].tok_s == 95_000.0
+        best = best_per_width(rows, max_l0=40)
+        # 4x: k64 (0.78 / 0.97) is over the cap; k32 wins both at L0 32.
+        assert best[4][0].name == "topk_x4_k32" and best[4][1].name == "topk_x4_k32"
+        # 8x: relu_lo has the best 1-FVU (0.69 at L0 39.5, under the cap)
+        assert best[8][0].name == "relu_x8_lo" and best[8][1].name == "relu_x8_mid"
+        # a cap nothing meets gives (None, None)
+        assert best_per_width(rows, max_l0=10) == {4: (None, None), 8: (None, None)}
+
+    def test_cli_writes_three_outputs(self, results, tmp_path):
+        import plot
+
+        out = tmp_path / "figures"
+        plot.main(["--results", str(results), "--out", str(out)])
+        for f in ("frontier.png", "ce.png", "tables.md"):
+            assert (out / f).exists() and (out / f).stat().st_size > 0
+        md = (out / "tables.md").read_text(encoding="utf-8")
+        assert "| " + " | ".join(plot.TABLE_COLUMNS) + " |" in md
+        for name, *_ in self.RUNS:
+            assert name in md
+        assert "| relu_x4_lo | relu | λ=0.005 | 3072 | 200,000,000 | 55.0 | 0.700 | 0.900 |" in md
+        assert "| topk_x4_k32 | topk | k=32 | 3072 |" in md
+        assert "Best per width (L0 <= 40)" in md
+        assert "| 4x | 3072 | topk_x4_k32 | 0.680 | 32.0 | topk_x4_k32 | 0.940 | 32.0 |" in md
+        assert "| 8x | 6144 | relu_x8_lo | 0.690 | 39.5 | relu_x8_mid | 0.910 | 30.0 |" in md
+        assert "Not evaluated" in md and "no_eval" in md
+        # a different cap changes the best-per-width table
+        plot.main(["--results", str(results), "--out", str(out), "--max-l0", "70"])
+        assert "| 4x | 3072 | topk_x4_k64 |" in (out / "tables.md").read_text(encoding="utf-8")
+
+    def test_empty_results_dir_exits(self, tmp_path):
+        import plot
+
+        with pytest.raises(SystemExit, match="no <run>/metrics.json"):
+            plot.main(["--results", str(tmp_path), "--out", str(tmp_path / "f")])

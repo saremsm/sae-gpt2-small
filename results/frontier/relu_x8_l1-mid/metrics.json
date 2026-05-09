@@ -1,0 +1,135 @@
+{
+  "run": "relu_x8_l1-mid",
+  "config": {
+    "sae": {
+      "d_model": 768,
+      "n_features": 6144,
+      "l1_coefficient": 0.005,
+      "lr": 0.0004,
+      "warmup_steps": 1000,
+      "normalize_decoder": true,
+      "normalize_input": true,
+      "activation": "relu",
+      "k": null,
+      "aux_k": 0,
+      "aux_coeff": 0.0,
+      "adam_betas": [
+        0.9,
+        0.99
+      ]
+    },
+    "layer": 8,
+    "hook_name": "blocks.8.hook_resid_post",
+    "device": "cuda",
+    "args": {
+      "config_json": "results/frontier/relu_x8_l1-mid/sweep_entry.json",
+      "train_shard": "data/train.bin",
+      "holdout_shard": "data/holdout.bin",
+      "n_tokens": 200000000,
+      "batch_seqs": 256,
+      "batch_tokens": 4096,
+      "buffer_tokens": 1000000,
+      "calibration_tokens": 100000,
+      "eval_tokens": 2000000,
+      "eval_batch_seqs": 64,
+      "run_name": "relu_x8_l1-mid",
+      "results_dir": "results/frontier",
+      "seed": 42,
+      "device": null,
+      "checkpoint": "results/frontier/relu_x8_l1-mid/checkpoint.pt",
+      "no_analysis": true,
+      "no_autocast": false,
+      "activation": "relu",
+      "k": 32,
+      "l1_coeff": 0.005,
+      "expansion": 8,
+      "lr": 0.0004,
+      "adam_betas": [
+        0.9,
+        0.99
+      ],
+      "warmup_steps": 1000,
+      "resample_interval": 5000,
+      "log_interval": null,
+      "aux_k": 0,
+      "aux_coeff": 0.0,
+      "forward": "hf"
+    },
+    "schedule": {
+      "warmup_steps": 1000,
+      "resample_interval": 5000,
+      "log_interval": 6
+    }
+  },
+  "metrics": {
+    "fvu": 0.275449669894901,
+    "variance_explained": 0.7245503301050991,
+    "mse_raw": 2.990144459771401,
+    "mse_scaled": 0.15573352292573325,
+    "l0": 14.035371804169722,
+    "dead_frac_eval": 0.010416666666666666,
+    "n_dead_eval": 64,
+    "n_tokens": 2007616,
+    "n_seqs": 15808,
+    "ce_clean": 3.858877844329334,
+    "ce_recon": 4.31670928718909,
+    "ce_zero": 13.813487725169178,
+    "loss_recovered": 0.9540080979224543,
+    "exclude_bos": true,
+    "identity": false,
+    "hook_name": "blocks.8.hook_resid_post"
+  },
+  "started_at": "2026-05-09T01:38:10+00:00",
+  "finished_at": "2026-05-09T02:16:03+00:00",
+  "git_sha": null,
+  "train_shard": {
+    "n_tokens": 220000000,
+    "n_seqs": 1718750,
+    "seq_len": 128,
+    "seed": 0,
+    "dataset": "monology/pile-uncopyrighted",
+    "split": "train",
+    "text_field": "text",
+    "doc_range": [
+      20000,
+      151072
+    ],
+    "n_docs": 131069,
+    "tokenizer": "gpt2",
+    "bos_id": 50256,
+    "eos_id": 50256,
+    "dtype": "uint16",
+    "packing": "bos at position 0 of every row; eos between documents"
+  },
+  "holdout_shard": {
+    "n_tokens": 32352512,
+    "n_seqs": 252754,
+    "seq_len": 128,
+    "seed": 0,
+    "dataset": "monology/pile-uncopyrighted",
+    "split": "train",
+    "text_field": "text",
+    "doc_range": [
+      0,
+      20000
+    ],
+    "n_docs": 20000,
+    "tokenizer": "gpt2",
+    "bos_id": 50256,
+    "eos_id": 50256,
+    "dtype": "uint16",
+    "packing": "bos at position 0 of every row; eos between documents"
+  },
+  "checkpoint": "results/frontier/relu_x8_l1-mid/checkpoint.pt",
+  "training": {
+    "tokens": 200003584,
+    "steps": 48828,
+    "final_loss": 0.2706700265407562,
+    "final_l0": 14.068115234375,
+    "final_aux_loss": 0.0,
+    "final_dead_features": 0,
+    "input_scale": 0.22821541130542755,
+    "loader_tok_s": 88052.78291847573,
+    "train_wall_seconds": 2137.8470147989938
+  }
+}

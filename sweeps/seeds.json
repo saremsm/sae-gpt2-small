@@ -1,0 +1,79 @@
+{
+    "_notes": [
+        "Seed replicate: the two 4x recipes on the frontier (topk k=32, relu lambda 2.5e-3) at seeds 1 and 2; seed 42 is the frontier row. Puts a number on seed variance for the numbers section's caveat. Run into its own results dir:",
+        "python sweep.py sweeps/seeds.json --results results/seeds   (4 runs, ~2.3 h on the A10); compare against results/frontier/{topk_x4_k32,relu_x4_l1-low}/metrics.json"
+    ],
+    "runs": [{
+            "name": "topk_x4_k32_s1",
+            "activation": "topk",
+            "k": 32,
+            "aux_k": 64,
+            "aux_coeff": 0.03125,
+            "expansion": 4,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 1,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "relu_x4_l1-low_s1",
+            "activation": "relu",
+            "l1_coeff": 0.0025,
+            "expansion": 4,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 1,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "topk_x4_k32_s2",
+            "activation": "topk",
+            "k": 32,
+            "aux_k": 64,
+            "aux_coeff": 0.03125,
+            "expansion": 4,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 2,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "relu_x4_l1-low_s2",
+            "activation": "relu",
+            "l1_coeff": 0.0025,
+            "expansion": 4,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 2,
+            "buffer_tokens": 1000000
+        }
+    ]
+}

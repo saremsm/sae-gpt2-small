@@ -30,8 +30,18 @@ class SAEConfig:
     # (feature_activation_counts == 0 in the current window)
     aux_k: int = 0
     aux_coeff: float = 0.0
+    # AdamW betas the training loop uses (train_sae passes them to the optimizer).
+    # Default is torch's (0.9, 0.999) - every numbers-table row; the frontier
+    # sweep uses (0.9, 0.99).
+    adam_betas: tuple[float, float] = (0.9, 0.999)
 
     def __post_init__(self) -> None:
+        betas = tuple(float(b) for b in self.adam_betas)
+        if len(betas) != 2 or not all(0.0 <= b < 1.0 for b in betas):
+            raise ValueError(
+                f"adam_betas must be two floats in [0, 1), got {self.adam_betas!r}"
+            )
+        object.__setattr__(self, "adam_betas", betas)
         if self.activation not in ("relu", "topk"):
             raise ValueError(
                 f"activation must be 'relu' or 'topk', got {self.activation!r}"

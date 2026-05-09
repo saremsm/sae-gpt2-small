@@ -1,0 +1,63 @@
+{
+  "run": "topk_x8_k64",
+  "sae": {
+    "d_model": 768,
+    "n_features": 6144,
+    "l1_coefficient": 0.0,
+    "lr": 0.0004,
+    "warmup_steps": 1000,
+    "normalize_decoder": true,
+    "normalize_input": true,
+    "activation": "topk",
+    "k": 64,
+    "aux_k": 128,
+    "aux_coeff": 0.03125,
+    "adam_betas": [
+      0.9,
+      0.99
+    ]
+  },
+  "layer": 8,
+  "hook_name": "blocks.8.hook_resid_post",
+  "device": "cuda",
+  "args": {
+    "config_json": "results/frontier/topk_x8_k64/sweep_entry.json",
+    "train_shard": "data/train.bin",
+    "holdout_shard": "data/holdout.bin",
+    "n_tokens": 200000000,
+    "batch_seqs": 256,
+    "batch_tokens": 4096,
+    "buffer_tokens": 1000000,
+    "calibration_tokens": 100000,
+    "eval_tokens": 2000000,
+    "eval_batch_seqs": 64,
+    "run_name": "topk_x8_k64",
+    "results_dir": "results/frontier",
+    "seed": 42,
+    "device": null,
+    "checkpoint": "results/frontier/topk_x8_k64/checkpoint.pt",
+    "no_analysis": true,
+    "no_autocast": false,
+    "activation": "topk",
+    "k": 64,
+    "l1_coeff": 0.005,
+    "expansion": 8,
+    "lr": 0.0004,
+    "adam_betas": [
+      0.9,
+      0.99
+    ],
+    "warmup_steps": 1000,
+    "resample_interval": 5000,
+    "log_interval": null,
+    "aux_k": 128,
+    "aux_coeff": 0.03125,
+    "forward": "hf"
+  },
+  "schedule": {
+    "warmup_steps": 1000,
+    "resample_interval": 5000,
+    "log_interval": 6
+  },
+  "started_at": "2026-05-09T04:24:24+00:00"
+}

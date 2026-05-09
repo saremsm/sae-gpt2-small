@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
 import time
@@ -47,10 +48,25 @@ WARMUP_TOKENS = 51_200
 RESAMPLE_TOKENS = 128_000
 LOG_TOKENS = 25_600
 
-def parse_args() -> argparse.Namespace:
+# --config-json keys that are spelled differently from the argparse dest.
+CONFIG_JSON_ALIASES = {"name": "run_name", "betas": "adam_betas"}
+DEFAULT_CHECKPOINT = "sae_gpt2_layer8.pt"
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train a layer-8 SAE from a pre-tokenized shard "
         "(see `python -m data tokenize`)."
+    )
+    parser.add_argument(
+        "--config-json", default=None,
+        help="JSON file of flag overrides keyed by flag name with "
+        "underscores (n_tokens, lr, l1_coeff, expansion, k, activation, "
+        "batch_tokens, resample_interval, warmup_steps, seed, run_name, "
+        "checkpoint, ...; `name` and `betas` are accepted as aliases for "
+        "run_name / adam_betas, keys starting with '_' are ignored). "
+        "Precedence: explicit CLI flag > JSON > default. sweep.py writes "
+        "one per run.",
     )
     parser.add_argument(
         "--train-shard", default="data/train.bin",
@@ -86,6 +102,11 @@ def parse_args() -> argparse.Namespace:
         "(x d_model x 4 bytes of GPU memory)",
     )
     parser.add_argument(
+        "--calibration-tokens", type=int, default=100_000,
+        help="raw tokens the SAE's input_scale is calibrated on before the "
+        "first step (train_sae; those batches are then trained on)",
+    )
+    parser.add_argument(
         "--eval-tokens", type=int, default=2_000_000,
         help="held-out tokens for the post-training evaluation (position-0 "
         "rows not counted); three fp32 GPT-2 forwards per token",
@@ -106,6 +127,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--device", default=None,
+        help="cuda | mps | cpu (default: the best available)",
+    )
+    parser.add_argument(
+        "--checkpoint", default=DEFAULT_CHECKPOINT,
+        help="where the trained SAE is saved (state_dict + config + "
+        "training history + train-shard sidecar); sweep.py sets "
+        "results/<run>/checkpoint.pt",
+    )
+    parser.add_argument(
+        "--no-analysis", action="store_true",
+        help="skip the feature analysis after training (it downloads "
+        "NeelNanda/pile-10k and runs the SAE over 100 texts); sweep.py "
+        "sets this",
+    )
+    parser.add_argument(
         "--no-autocast", action="store_true",
         help="run the GPT-2 forward in fp32 instead of bf16 autocast (CUDA)",
     )
@@ -120,6 +157,46 @@ def parse_args() -> argparse.Namespace:
         "--k", type=int, default=32,
         help="latents kept per token under --activation topk (ignored "
         "under relu)",
+    )
+    parser.add_argument(
+        "--l1-coeff", type=float, default=5e-3,
+        help="L1 coefficient under --activation relu (ignored under "
+        "topk); 5e-3 is the numbers-table recipe",
+    )
+    parser.add_argument(
+        "--expansion", type=float, default=4.0,
+        help="dictionary size as a multiple of d_model: n_features = "
+        "expansion x 768 (4 -> 3072, the recipe; 8 -> 6144; 16 -> 12288)",
+    )
+    parser.add_argument(
+        "--lr", type=float, default=2e-4,
+        help="AdamW learning rate after warmup (2e-4 is the numbers-table "
+        "recipe at batch 512; the frontier sweep uses 4e-4 at 4096)",
+    )
+    parser.add_argument(
+        "--adam-betas", type=float, nargs=2, default=(0.9, 0.999),
+        metavar=("B1", "B2"),
+        help="AdamW betas (default torch's 0.9 0.999; the sweep uses "
+        "0.9 0.99)",
+    )
+    parser.add_argument(
+        "--warmup-steps", type=int, default=None,
+        help="LR warmup in optimizer steps; default is token-denominated "
+        f"({WARMUP_TOKENS:,} tokens = 100 steps at batch 512, 12 at 4096 "
+        "- set it explicitly for large-batch runs)",
+    )
+    parser.add_argument(
+        "--resample-interval", type=int, default=None,
+        help="dead-feature resampling / counting-window length in "
+        f"optimizer steps; default is token-denominated ({RESAMPLE_TOKENS:,} "
+        "tokens = 250 steps at 512, 31 at 4096). This is also the window "
+        "in which a feature must fire to count as alive",
+    )
+    parser.add_argument(
+        "--log-interval", type=int, default=None,
+        help="history / train_log.jsonl cadence in optimizer steps; default "
+        f"is token-denominated ({LOG_TOKENS:,} tokens = 50 steps at 512, 6 "
+        "at 4096)",
     )
     parser.add_argument(
         "--aux-k", type=int, default=0,
@@ -138,7 +215,100 @@ def parse_args() -> argparse.Namespace:
         "always uses TransformerLens): tl = HookedTransformer, hf = "
         "HuggingFace GPT2Model with SDPA, same residual (data.HFResidualModel)",
     )
-    return parser.parse_args()
+    return parser
+
+
+def load_config_json(path: str, parser: argparse.ArgumentParser) -> dict:
+    """Read a --config-json file into {argparse dest: value}. String values are
+    passed through the flag's `type`, so "4e-4" works as well as 4e-4."""
+    with open(path) as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise SystemExit(f"{path}: --config-json must hold a JSON object")
+    actions = {
+        a.dest: a for a in parser._actions
+        if a.dest not in ("help", "config_json")
+    }
+    out: dict = {}
+    for key, value in raw.items():
+        if key.startswith("_"):
+            continue
+        dest = CONFIG_JSON_ALIASES.get(key, key)
+        if dest not in actions:
+            raise SystemExit(
+                f"{path}: unknown key {key!r}; valid keys: "
+                f"{', '.join(sorted(actions))} (aliases: "
+                f"{', '.join(f'{k}->{v}' for k, v in CONFIG_JSON_ALIASES.items())})"
+            )
+        action = actions[dest]
+        if isinstance(value, str) and callable(action.type):
+            value = action.type(value)
+        if action.choices is not None and value not in action.choices:
+            raise SystemExit(
+                f"{path}: {key}={value!r} not in {list(action.choices)}"
+            )
+        out[dest] = value
+    return out
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """CLI flags, with --config-json overrides layered under them: explicit flag >
+    JSON value > argparse default."""
+    parser = build_parser()
+    pre, _ = parser.parse_known_args(argv)
+    if pre.config_json is not None:
+        parser.set_defaults(**load_config_json(pre.config_json, parser))
+    args = parser.parse_args(argv)
+    args.adam_betas = tuple(float(b) for b in args.adam_betas)
+    if args.expansion <= 0:
+        raise SystemExit(f"--expansion must be > 0, got {args.expansion}")
+    return args
+
+
+def sae_config_from_args(args: argparse.Namespace, d_model: int) -> SAEConfig:
+    """The SAEConfig a parsed argument set describes. n_features = round(expansion x
+    d_model). topk: MSE-only loss."""
+    is_topk = args.activation == "topk"
+    return SAEConfig(
+        d_model=d_model,
+        n_features=int(round(args.expansion * d_model)),
+        l1_coefficient=0.0 if is_topk else args.l1_coeff,
+        lr=args.lr,
+        warmup_steps=schedule_from_args(args)["warmup_steps"],
+        activation=args.activation,
+        k=args.k if is_topk else None,
+        aux_k=args.aux_k if is_topk else 0,
+        aux_coeff=args.aux_coeff if is_topk else 0.0,
+        adam_betas=args.adam_betas,
+    )
+
+
+def schedule_from_args(args: argparse.Namespace) -> dict:
+    """warmup_steps / resample_interval / log_interval in optimizer steps: the
+    token-denominated defaults (WARMUP_TOKENS / RESAMPLE_TOKENS / LOG_TOKENS over
+    batch_tokens) unless --warmup-steps / --resample-interval / --log-interval."""
+    warmup = (
+        args.warmup_steps if args.warmup_steps is not None
+        else max(10, WARMUP_TOKENS // args.batch_tokens)
+    )
+    resample = (
+        args.resample_interval if args.resample_interval is not None
+        else max(1, RESAMPLE_TOKENS // args.batch_tokens)
+    )
+    log = (
+        args.log_interval if args.log_interval is not None
+        else max(1, LOG_TOKENS // args.batch_tokens)
+    )
+    if min(warmup, resample, log) < 1:
+        raise SystemExit(
+            f"--warmup-steps ({warmup}), --resample-interval ({resample}) "
+            f"and --log-interval ({log}) must be >= 1"
+        )
+    return {
+        "warmup_steps": warmup,
+        "resample_interval": resample,
+        "log_interval": log,
+    }
 
 
 def plot_training_history(history: dict, save_path: str = "training_history.png") -> None:
@@ -197,8 +367,8 @@ def plot_training_history(history: dict, save_path: str = "training_history.png"
     print(f"Training history saved to '{save_path}'")
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     started_at = utc_now_iso()
 
     SEED = args.seed
@@ -208,13 +378,17 @@ def main() -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED)
 
-    if torch.cuda.is_available():
+    if args.device is not None:
+        device = args.device
+    elif torch.cuda.is_available():
         device = "cuda"
     elif torch.backends.mps.is_available():
         device = "mps"
     else:
         device = "cpu"
     print(f"Using device: {device}")
+    run_name = args.run_name or time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    run_dir = os.path.join(args.results_dir, run_name)
 
     # Fail on a missing shard before spending time on the model load.
     if not os.path.exists(args.train_shard):
@@ -248,25 +422,15 @@ def main() -> None:
     else:
         forward_model = model
 
-    # warmup 51.2K tokens (100 steps at 512) vs ~976 steps at 512: the previous
-    # 1000-step warmup kept the whole run inside warmup (train_sae also warn-
-    # clamps).
-    warmup_steps = max(10, WARMUP_TOKENS // args.batch_tokens)
-    resample_interval = max(1, RESAMPLE_TOKENS // args.batch_tokens)
-    log_interval = max(1, LOG_TOKENS // args.batch_tokens)
-    # topk: MSE-only loss, so the L1 coefficient is 0.
+    # Defaults are token-denominated: warmup 51.2K tokens (100 steps at 512) vs
+    # ~976 steps at 512 - the previous 1000-step warmup kept the whole run inside
+    # warmup (train_sae also warn-clamps)
+    schedule = schedule_from_args(args)
+    warmup_steps = schedule["warmup_steps"]
+    resample_interval = schedule["resample_interval"]
+    log_interval = schedule["log_interval"]
+    config = sae_config_from_args(args, model.cfg.d_model)
     is_topk = args.activation == "topk"
-    config = SAEConfig(
-        d_model=model.cfg.d_model,
-        n_features=3072,
-        l1_coefficient=0.0 if is_topk else 5e-3,
-        lr=2e-4,
-        warmup_steps=warmup_steps,
-        activation=args.activation,
-        k=args.k if is_topk else None,
-        aux_k=args.aux_k if is_topk else 0,
-        aux_coeff=args.aux_coeff if is_topk else 0.0,
-    )
     if not is_topk and (args.aux_k or args.aux_coeff):
         print(
             "NOTE: --aux-k / --aux-coeff only apply with --activation topk; "
@@ -274,11 +438,25 @@ def main() -> None:
         )
     print(
         f"Schedule: batch_tokens={args.batch_tokens}, warmup {warmup_steps} steps "
-        f"({WARMUP_TOKENS:,} tok), resample every {resample_interval} steps "
-        f"({RESAMPLE_TOKENS:,} tok), log every {log_interval} steps"
+        f"({warmup_steps * args.batch_tokens:,} tok), resample every "
+        f"{resample_interval} steps ({resample_interval * args.batch_tokens:,} "
+        f"tok), log every {log_interval} steps"
     )
 
     sae = SparseAutoencoder(config)
+
+    # Resolved configuration.
+    run_config = {
+        "run": run_name,
+        "sae": asdict(config),
+        "layer": TARGET_LAYER,
+        "hook_name": hook_name,
+        "device": device,
+        "args": vars(args),
+        "schedule": schedule,
+        "started_at": started_at,
+    }
+    write_json(os.path.join(run_dir, "config.json"), run_config)
 
     train_shard = TokenShard(args.train_shard)
     print(
@@ -315,6 +493,8 @@ def main() -> None:
         log_interval=log_interval,
         device=device,
         seed=SEED,
+        calibration_tokens=args.calibration_tokens,
+        log_jsonl=os.path.join(run_dir, "train_log.jsonl"),
     )
     train_wall = time.perf_counter() - t_train
     print(
@@ -323,7 +503,8 @@ def main() -> None:
         f"SAE step, {loader.n_refills} buffer refills)"
     )
 
-    checkpoint_path = "sae_gpt2_layer8.pt"
+    checkpoint_path = args.checkpoint
+    os.makedirs(os.path.dirname(os.path.abspath(checkpoint_path)), exist_ok=True)
     # plain-dict config: loads under torch.load's safe weights_only=True.
     torch.save(
         {
@@ -340,7 +521,7 @@ def main() -> None:
         f"(input_scale={sae.input_scale.item():.5f})"
     )
 
-    plot_training_history(history)
+    plot_training_history(history, os.path.join(run_dir, "training_history.png"))
 
     metrics = None
     holdout_meta = None
@@ -359,21 +540,9 @@ def main() -> None:
         )
         print_metrics(metrics, sae.input_scale.item())
 
-    run_name = args.run_name or time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     record = make_run_record(
         run=run_name,
-        config={
-            "sae": asdict(config),
-            "layer": TARGET_LAYER,
-            "hook_name": hook_name,
-            "device": device,
-            "args": vars(args),
-            "schedule": {
-                "warmup_steps": warmup_steps,
-                "resample_interval": resample_interval,
-                "log_interval": log_interval,
-            },
-        },
+        config={k: v for k, v in run_config.items() if k not in ("run", "started_at")},
         metrics=metrics,
         started_at=started_at,
         train_shard=train_shard.meta,
@@ -395,12 +564,14 @@ def main() -> None:
             "train_wall_seconds": train_wall,
         },
     )
-    metrics_path = write_json(
-        os.path.join(args.results_dir, run_name, "metrics.json"), record
-    )
+    metrics_path = write_json(os.path.join(run_dir, "metrics.json"), record)
     print(f"metrics written to {metrics_path}")
     if metrics is None:
         print("(no held-out shard: metrics is null in metrics.json)")
+
+    if args.no_analysis:
+        print("\n--no-analysis: skipping the feature analysis.")
+        return
 
     print("\nLoading analysis texts...")
     dataset = load_dataset("NeelNanda/pile-10k", split="train")

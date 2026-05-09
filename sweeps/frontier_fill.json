@@ -1,0 +1,109 @@
+{
+    "_notes": [
+        "L1 fill-in for the frontier (measured lambda 2.5e-3 -> L0 ~35, 5e-3 -> ~13.5, 1e-2 -> ~4.3 at every width; L0 fell ~2.6-3.1x per doubling of lambda). Two more values per width to reach the 20-60 range the bracket was meant to cover: 1.6e-3 (target L0 ~55) and 3.5e-3 (target ~22). Same recipe as sweeps/frontier.json; run into the SAME results dir so plot.py folds them into the frontier:",
+        "python sweep.py sweeps/frontier_fill.json --results results/frontier   (6 runs, ~4 h on the A10)"
+    ],
+    "runs": [{
+            "name": "relu_x4_l1-xlow",
+            "activation": "relu",
+            "l1_coeff": 0.0016,
+            "expansion": 4,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "relu_x4_l1-midlow",
+            "activation": "relu",
+            "l1_coeff": 0.0035,
+            "expansion": 4,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "relu_x8_l1-xlow",
+            "activation": "relu",
+            "l1_coeff": 0.0016,
+            "expansion": 8,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "relu_x8_l1-midlow",
+            "activation": "relu",
+            "l1_coeff": 0.0035,
+            "expansion": 8,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "relu_x16_l1-xlow",
+            "activation": "relu",
+            "l1_coeff": 0.0016,
+            "expansion": 16,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        },
+        {
+            "name": "relu_x16_l1-midlow",
+            "activation": "relu",
+            "l1_coeff": 0.0035,
+            "expansion": 16,
+            "n_tokens": 200000000,
+            "lr": 0.0004,
+            "betas": [
+                0.9,
+                0.99
+            ],
+            "batch_tokens": 4096,
+            "warmup_steps": 1000,
+            "resample_interval": 5000,
+            "seed": 42,
+            "buffer_tokens": 1000000
+        }
+    ]
+}
