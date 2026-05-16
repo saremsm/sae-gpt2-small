@@ -1,5 +1,6 @@
 """benchmark the training pipeline: GPT-2 forward + activation buffer + SAE step.
-Exits non-zero if pass-2 tok/s < --min-tok-s."""
+That is ~5% under the 100K gate, which was calibrated at 4x (the frontier sweep:
+102.6K ReLU 4x, 91K TopK 4x); the two SAE matmuls are twice as large at 8x."""
 
 from __future__ import annotations
 
@@ -54,17 +55,47 @@ def make_loader(
     )
 
 
-def bench_loader(loader: ActivationLoader, n_tokens: int, device: str) -> float:
-    """tok/s of the loader alone over n_tokens yielded rows."""
+class Window:
+    """One timed benchmark window: rows yielded."""
+
+    def __init__(self, yielded: int, forwarded_yieldable: float, seconds: float):
+        self.yielded = yielded
+        self.forwarded_yieldable = forwarded_yieldable
+        self.seconds = seconds
+
+    @property
+    def raw_tok_s(self) -> float:
+        return self.yielded / self.seconds if self.seconds > 0 else 0.0
+
+    @property
+    def forward_tok_s(self) -> float:
+        """Yieldable rows forwarded per second."""
+        return self.forwarded_yieldable / self.seconds if self.seconds > 0 else 0.0
+
+
+def _yieldable_fraction(loader: ActivationLoader) -> float:
+    """Share of forwarded tokens the loader yields (position 0 dropped)."""
+    seq_len = loader.shard.seq_len
+    return (seq_len - 1) / seq_len if loader.exclude_bos else 1.0
+
+
+def bench_loader(loader: ActivationLoader, n_tokens: int, device: str) -> Window:
+    """The loader alone over n_tokens yielded rows, timed from AFTER the first yield
+    (the initial buffer fill is outside the window)."""
+    it = iter(loader)
+    next(it)
     _sync(device)
+    fwd0 = loader.tokens_forwarded
     t0 = time.perf_counter()
     n = 0
-    for batch in loader:
+    for batch in it:
         n += batch.shape[0]
         if n >= n_tokens:
             break
     _sync(device)
-    return n / (time.perf_counter() - t0)
+    seconds = time.perf_counter() - t0
+    fwd = (loader.tokens_forwarded - fwd0) * _yieldable_fraction(loader)
+    return Window(n, fwd, seconds)
 
 
 def bench_loader_and_sae(
@@ -72,10 +103,14 @@ def bench_loader_and_sae(
     sae: SparseAutoencoder,
     n_tokens: int,
     device: str,
-) -> tuple[float, float | None]:
-    """tok/s of loader + SAE train step over n_tokens rows (after WARMUP_STEPS
-    untimed steps), plus mean sampled GPU utilization."""
-    optimizer = AdamW(sae.parameters(), lr=sae.config.lr, weight_decay=0.0)
+) -> tuple[Window, float | None]:
+    """Loader + SAE train step over n_tokens rows (after WARMUP_STEPS untimed
+    steps): the timed Window plus mean sampled GPU utilization. main() turns the
+    window into the steady-state number using the loader's forward rate from pass"""
+    optimizer = AdamW(
+        sae.parameters(), lr=sae.config.lr, betas=sae.config.adam_betas,
+        weight_decay=0.0,
+    )
     sae.train()
     it = iter(loader)
 
@@ -88,6 +123,7 @@ def bench_loader_and_sae(
 
     utils: list[int] = []
     next_sample = time.perf_counter() + UTIL_SAMPLE_SECONDS
+    fwd0 = loader.tokens_forwarded
     t0 = time.perf_counter()
     n = 0
     for batch in it:
@@ -102,9 +138,10 @@ def bench_loader_and_sae(
         if n >= n_tokens:
             break
     _sync(device)
-    tok_s = n / (time.perf_counter() - t0)
+    seconds = time.perf_counter() - t0
+    fwd = (loader.tokens_forwarded - fwd0) * _yieldable_fraction(loader)
     mean_util = sum(utils) / len(utils) if utils else None
-    return tok_s, mean_util
+    return Window(n, fwd, seconds), mean_util
 
 
 def main() -> None:
@@ -114,8 +151,14 @@ def main() -> None:
     parser.add_argument("--min-tok-s", type=float, default=0.0)
     parser.add_argument("--batch-seqs", type=int, default=256)
     parser.add_argument("--batch-tokens", type=int, default=BATCH_SIZE)
-    parser.add_argument("--buffer-tokens", type=int, default=1_000_000)
-    parser.add_argument("--n-features", type=int, default=3072)
+    parser.add_argument("--buffer-tokens", type=int, default=2_000_000)
+    parser.add_argument("--n-features", type=int, default=6144,
+                        help="dictionary size (default 6144 = 8 x 768, the "
+                        "default expansion)")
+    parser.add_argument("--activation", choices=["relu", "topk"], default="relu",
+                        help="encoder variant of the benched SAE step")
+    parser.add_argument("--k", type=int, default=32,
+                        help="latents per token under --activation topk")
     parser.add_argument("--layer", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -142,20 +185,25 @@ def main() -> None:
         f"batch_seqs={args.batch_seqs}, batch_tokens={args.batch_tokens}, "
         f"buffer_tokens={args.buffer_tokens:,}, "
         f"autocast={'off' if args.no_autocast else 'bf16'}, "
-        f"forward={args.forward}"
+        f"forward={args.forward}, sae={args.n_features} features "
+        f"{args.activation}" + (f" k={args.k}" if args.activation == "topk" else "")
     )
 
     model = load_forward_model(args.forward, device)
 
     # Pass 1: loader alone, with the read / forward split measured.
     loader = make_loader(model, shard, args, device, profile=True)
-    loader_tok_s = bench_loader(loader, args.n_tokens, device)
+    w1 = bench_loader(loader, args.n_tokens, device)
+    loader_tok_s = w1.forward_tok_s
     busy = loader.read_seconds + loader.forward_seconds
     read_pct = 100.0 * loader.read_seconds / busy if busy > 0 else 0.0
     print(
-        f"\nLoader alone        : {loader_tok_s:,.0f} tok/s "
-        f"({loader.n_chunks} forwards of {args.batch_seqs} seqs, "
-        f"{loader.n_refills} refills)"
+        f"\nLoader alone        : {loader_tok_s:,.0f} tok/s steady state "
+        f"(yieldable rows forwarded per second; raw window {w1.raw_tok_s:,.0f} "
+        f"tok/s over {w1.yielded:,} yielded / {w1.forwarded_yieldable:,.0f} "
+        f"forwarded in {w1.seconds:.1f}s - the difference is the buffer's "
+        f"borrowed top half; {loader.n_chunks} forwards of {args.batch_seqs} "
+        f"seqs, {loader.n_refills} refills)"
     )
     print(
         f"  shard read + H2D  : {read_pct:.1f}% of loader busy time "
@@ -178,12 +226,33 @@ def main() -> None:
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     loader = make_loader(model, shard, args, device, profile=False)
-    cfg = SAEConfig(d_model=model.cfg.d_model, n_features=args.n_features)
+    is_topk = args.activation == "topk"
+    cfg = SAEConfig(
+        d_model=model.cfg.d_model, n_features=args.n_features,
+        l1_coefficient=0.0 if is_topk else SAEConfig.l1_coefficient,
+        activation=args.activation, k=args.k if is_topk else None,
+    )
     sae = SparseAutoencoder(cfg).to(device)
-    tok_s, util = bench_loader_and_sae(loader, sae, args.n_tokens, device)
+    w2, util = bench_loader_and_sae(loader, sae, args.n_tokens, device)
+    # Steady state: the window's time minus what its forwards cost at the
+    if loader_tok_s > 0 and w2.yielded > 0:
+        step_seconds = max(0.0, w2.seconds - w2.forwarded_yieldable / loader_tok_s)
+        s_per_tok = step_seconds / w2.yielded
+        tok_s = 1.0 / (1.0 / loader_tok_s + s_per_tok)
+    else:
+        s_per_tok = 0.0
+        tok_s = w2.raw_tok_s
     print(
-        f"Loader + SAE step   : {tok_s:,.0f} tok/s "
-        f"(batch {args.batch_tokens}, {args.n_features} features)"
+        f"Loader + SAE step   : {tok_s:,.0f} tok/s steady state "
+        f"(raw window {w2.raw_tok_s:,.0f} tok/s over {w2.yielded:,} rows in "
+        f"{w2.seconds:.1f}s; batch {args.batch_tokens}, {args.n_features} "
+        f"features, {args.activation})"
+    )
+    print(
+        f"  SAE step          : {1e6 * s_per_tok:.2f} us/token = "
+        f"{1e3 * s_per_tok * args.batch_tokens:.1f} ms per "
+        f"{args.batch_tokens}-token step (window time minus its forwards "
+        f"at the loader's rate)"
     )
     if util is None:
         print(

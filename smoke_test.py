@@ -1,14 +1,13 @@
-"""CPU smoke test: build a tiny shard from in-memory text, run GPT-2 through the
-ActivationLoader, train a small SAE for 2000 tokens."""
+"""CPU smoke test of the whole training path: build two tiny document-disjoint
+shards from in-memory text, train a small SAE through `main.main` for 2000 tokens
+(real GPT-2, TransformerLens forward, derived schedule)"""
 
 import tempfile
 from pathlib import Path
 
-from transformer_lens import HookedTransformer
-
-from data import ActivationLoader, TokenShard, resid_post_hook, tokenize_corpus
-from sparse_autoencoder import SAEConfig, SparseAutoencoder
-from training import train_sae
+import eval as eval_mod
+import main
+from data import TokenShard, tokenize_corpus
 
 SEQ_LEN = 64
 DOCS = [
@@ -22,27 +21,36 @@ tmp = Path(tempfile.mkdtemp())
 tokenize_corpus(
     DOCS,
     out_path=str(tmp / "train.bin"),
-    n_tokens=64 * SEQ_LEN,
+    n_tokens=96 * SEQ_LEN,
     seq_len=SEQ_LEN,
+    holdout_docs=8,
+    holdout_path=str(tmp / "holdout.bin"),
 )
-shard = TokenShard(tmp / "train.bin")
-print(f"shard: {shard.n_seqs} seqs x {shard.seq_len}")
-
-model = HookedTransformer.from_pretrained("gpt2")
-loader = ActivationLoader(
-    model, shard, resid_post_hook(8),
-    batch_seqs=8, batch_tokens=256, buffer_tokens=2048, device="cpu",
-    log_every=0,
-)
-cfg = SAEConfig(d_model=768, n_features=256, l1_coefficient=8e-4, warmup_steps=10)
-sae = SparseAutoencoder(cfg)
-history = train_sae(
-    sae, loader, n_training_tokens=2000, log_interval=1, device="cpu",
-    calibration_tokens=1024,
+train, holdout = TokenShard(tmp / "train.bin"), TokenShard(tmp / "holdout.bin")
+print(
+    f"shards: train {train.n_seqs} seqs x {train.seq_len} (docs "
+    f"{train.meta['doc_range']}), holdout {holdout.n_seqs} seqs (docs "
+    f"{holdout.meta['doc_range']})"
 )
 
-if history["loss"]:
-    print("smoke test passed, final loss:", history["loss"][-1])
-    print(f"loader: {loader.throughput_tok_s():,.0f} tok/s on CPU")
-else:
-    print("Training ran but produced no log entries - increase n_training_tokens or lower log_interval")
+results = tmp / "results"
+checkpoint = results / "smoke" / "checkpoint.pt"
+# Small everything; warmup / resampling use the derived defaults.
+main.main([
+    "--train-shard", str(train.path), "--holdout-shard", str(holdout.path),
+    "--run-name", "smoke", "--results-dir", str(results),
+    "--checkpoint", str(checkpoint), "--no-analysis", "--forward", "tl",
+    "--device", "cpu", "--expansion", "1", "--n-tokens", "2000",
+    "--batch-tokens", "128", "--buffer-tokens", "1024", "--batch-seqs", "8",
+    "--calibration-tokens", "512", "--eval-tokens", "500",
+    "--eval-batch-seqs", "8", "--log-interval", "2",
+])
+
+metrics_json = results / "smoke" / "metrics.json"
+print("\n--- python -m eval --compare (must reproduce metrics.json) ---")
+# --n-tokens / --batch-seqs come from the checkpoint; exits 1 on mismatch.
+eval_mod.main([
+    "--checkpoint", str(checkpoint), "--holdout", str(holdout.path),
+    "--compare", str(metrics_json), "--device", "cpu",
+])
+print("\nsmoke test passed: main.py trained, python -m eval reproduced metrics.json")

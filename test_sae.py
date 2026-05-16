@@ -1759,7 +1759,8 @@ def _fake_metrics_record(name, activation, expansion, l0, ve, lr, k=None, l1=5e-
 
 class TestSAEConfigBetas:
     def test_default_and_coercion(self):
-        assert SAEConfig(d_model=8, n_features=16).adam_betas == (0.9, 0.999)
+        # The sweep's betas are the default.
+        assert SAEConfig(d_model=8, n_features=16).adam_betas == (0.9, 0.99)
         cfg = SAEConfig(d_model=8, n_features=16, adam_betas=[0.9, 0.99])
         assert cfg.adam_betas == (0.9, 0.99) and isinstance(cfg.adam_betas, tuple)
         for bad in ((0.9,), (0.9, 1.0), (-0.1, 0.99)):
@@ -1834,10 +1835,18 @@ class TestMainConfigJson:
         assert args.batch_tokens == 4096
         # untouched defaults survive
         assert args.forward == "hf" and args.eval_tokens == 2_000_000
-        # and the plain CLI still works with defaults
+        # and the plain CLI still works with defaults.
         d = main.parse_args([])
-        assert d.expansion == 4.0 and d.lr == 2e-4 and d.adam_betas == (0.9, 0.999)
+        assert d.n_tokens == 200_000_000 and d.batch_tokens == 4096
+        assert d.expansion == 8.0 and d.lr == 4e-4 and d.adam_betas == (0.9, 0.99)
+        assert d.buffer_tokens == 2_000_000 and d.eval_tokens == 2_000_000
+        assert d.analysis_dataset == "monology/pile-uncopyrighted"
         assert d.checkpoint == main.DEFAULT_CHECKPOINT and d.warmup_steps is None
+        assert d.resample_interval is None and d.log_interval is None
+        # SAEConfig's own defaults are the same recipe.
+        cfg = SAEConfig(d_model=768, n_features=6144)
+        assert cfg.lr == d.lr and cfg.adam_betas == d.adam_betas
+        assert cfg.warmup_steps == main.default_schedule(d.n_tokens, d.batch_tokens)["warmup_steps"]
 
     def test_unknown_key_and_bad_choice_raise(self, tmp_path):
         import main
@@ -1855,8 +1864,8 @@ class TestMainConfigJson:
 
     def test_sae_config_and_schedule_from_args(self, tmp_path):
         """expansion -> n_features, l1_coeff / k / betas / lr into the SAEConfig,
-        topk zeroes L1, relu drops k and AuxK; token-denominated schedule
-        defaults vs explicit overrides."""
+        topk zeroes L1, relu drops k and AuxK; derived schedule defaults vs
+        explicit overrides."""
         import main
 
         a = main.parse_args(["--activation", "relu", "--l1-coeff", "2.5e-3",
@@ -1867,9 +1876,9 @@ class TestMainConfigJson:
         assert cfg.k is None and cfg.aux_k == 0 and cfg.lr == 4e-4
         assert cfg.adam_betas == (0.9, 0.99)
         sched = main.schedule_from_args(a)
-        assert sched == {"warmup_steps": max(10, main.WARMUP_TOKENS // 4096),
-                         "resample_interval": main.RESAMPLE_TOKENS // 4096,
-                         "log_interval": main.LOG_TOKENS // 4096}
+        assert sched == main.default_schedule(a.n_tokens, 4096) == {
+            "warmup_steps": 976, "resample_interval": 6103,
+            "log_interval": main.LOG_TOKENS // 4096}
         assert cfg.warmup_steps == sched["warmup_steps"]
 
         b = main.parse_args(["--activation", "topk", "--k", "16", "--aux-k", "32",
@@ -1928,12 +1937,257 @@ class TestMainInProcess:
         assert [r["step"] for r in rows] == list(range(2, 17, 2))
         run_cfg = json.load(open(d / "config.json"))
         assert run_cfg["run"] == "tiny_topk" and run_cfg["hook_name"] == "blocks.1.hook_resid_post"
-        from eval import load_checkpoint
+        from eval import CHECKPOINT_KEYS, load_checkpoint
 
         sae, ckpt = load_checkpoint(str(d / "checkpoint.pt"), "cpu")
         assert sae.config.k == 8 and sae.config.adam_betas == (0.9, 0.99)
         assert sae.config.n_features == 4 * tiny_model.cfg.d_model
         assert ckpt["layer"] == 1 and sae.input_scale.item() != 1.0
+        # Checkpoint contents: config, input_scale, activation, k, git SHA.
+        assert set(CHECKPOINT_KEYS) <= set(ckpt)
+        assert ckpt["hook_name"] == "blocks.1.hook_resid_post"
+        assert ckpt["input_scale"] == pytest.approx(sae.input_scale.item())
+        assert ckpt["activation"] == "topk" and ckpt["k"] == 8
+        assert ckpt["torch_version"] == torch.__version__
+        assert ckpt["gpu_name"] is None and ckpt["device"] == "cpu"
+        assert ckpt["git_sha"] == record["git_sha"]
+        assert ckpt["run_config"]["args"]["eval_tokens"] == 500
+        assert ckpt["run_config"]["args"]["eval_batch_seqs"] == 8
+        assert ckpt["run_config"]["schedule"] == record["config"]["schedule"]
+        assert record["torch_version"] == torch.__version__ and record["gpu_name"] is None
+
+
+# Recipe defaults, config round-trip, checkpoint provenance.
+
+
+class TestA6Defaults:
+    def test_default_schedule_is_derived_from_the_run_length(self):
+        """warmup = 2% of total steps, resample_interval = total steps // 8 (so
+        resampling fires 8 >= 6 times per run), log_interval token- denominated;
+        the default recipe gives 976 / 6103 / 6; every value >= 1 at any budget."""
+        import main
+
+        steps = 200_000_000 // 4096
+        assert steps == 48_828
+        sched = main.default_schedule(200_000_000, 4096)
+        assert sched == {"warmup_steps": 976, "resample_interval": 6103,
+                         "log_interval": 6}
+        assert sched["warmup_steps"] == int(main.WARMUP_FRACTION * steps)
+        assert steps // sched["resample_interval"] == main.RESAMPLES_PER_RUN >= 6
+        # a resample interval is a dead-feature counting window: 25.0M tokens.
+        assert sched["resample_interval"] * 4096 == 24_997_888
+        for n_tokens, batch in ((500_000, 512), (2_000_000, 4096), (2000, 128),
+                                (200_000, 4096), (100, 4096)):
+            d = main.default_schedule(n_tokens, batch)
+            n_steps = max(1, n_tokens // batch)
+            assert min(d.values()) >= 1
+            assert d["warmup_steps"] <= max(1, n_steps // 20)  # never outlives the run
+            if n_steps >= main.RESAMPLES_PER_RUN:
+                assert n_steps // d["resample_interval"] >= 6
+        with pytest.raises(SystemExit, match="batch-tokens"):
+            main.default_schedule(1000, 0)
+        a = main.parse_args(["--warmup-steps", "1000", "--resample-interval", "5000"])
+        s = main.schedule_from_args(a)
+        assert s["warmup_steps"] == 1000 and s["resample_interval"] == 5000
+        assert s["log_interval"] == main.LOG_TOKENS // 4096
+
+    def test_library_defaults_agree_with_the_cli(self):
+        """training.py / SAEConfig defaults are the same recipe main.py exposes:
+        batch 4096, 200M tokens, lr 4e-4, betas (0.9, 0.99), warmup 976 = the
+        derived value at the default recipe."""
+        import inspect
+        import main
+        import training
+
+        assert training.BATCH_SIZE == 4096 == main.parse_args([]).batch_tokens
+        sig = inspect.signature(training.train_sae)
+        assert sig.parameters["n_training_tokens"].default == main.DEFAULT_N_TOKENS
+        cfg = SAEConfig(d_model=768, n_features=int(main.DEFAULT_EXPANSION * 768))
+        assert cfg.n_features == 6144 and cfg.lr == 4e-4
+        assert cfg.adam_betas == (0.9, 0.99) and cfg.warmup_steps == 976
+
+    def test_no_stale_defaults_in_source(self):
+        """the grep gate: no pile-10k / 500K / 500_000 left in the code (the README
+        keeps them as labeled history in its numbers table)."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        files = ["main.py", "training.py", "sparse_autoencoder.py", "eval.py",
+                 "data.py", "analysis.py", "bench_pipeline.py", "profile_sae.py",
+                 "smoke_test.py", "sweep.py", "plot.py"]
+        stale = ("pile-" + "10k", "500" + "_000", "500" + "K", "NeelNanda")
+        for name in files:
+            text = open(os.path.join(here, name), encoding="utf-8").read()
+            for needle in stale:
+                assert needle not in text, f"{name} still mentions {needle!r}"
+
+
+class TestSAEConfigRoundTrip:
+    CONFIGS = [
+        SAEConfig(d_model=768, n_features=6144),
+        SAEConfig(d_model=768, n_features=3072, activation="topk", k=32,
+                  l1_coefficient=0.0, aux_k=64, aux_coeff=1 / 32,
+                  adam_betas=(0.9, 0.99), lr=4e-4, warmup_steps=1000),
+        SAEConfig(d_model=64, n_features=128, l1_coefficient=2.5e-3,
+                  normalize_input=False, normalize_decoder=False),
+    ]
+
+    def test_asdict_json_round_trip(self):
+        """SAEConfig -> asdict -> JSON -> SAEConfig is the identity."""
+        for cfg in self.CONFIGS:
+            as_json = json.loads(json.dumps(dataclasses.asdict(cfg)))
+            assert isinstance(as_json["adam_betas"], list)
+            back = SAEConfig(**as_json)
+            assert back == cfg and isinstance(back.adam_betas, tuple)
+            assert dataclasses.asdict(back) == dataclasses.asdict(cfg)
+
+    def test_checkpoint_round_trip_carries_config_and_provenance(self, tmp_path):
+        """eval.make_checkpoint -> torch.save -> eval.load_checkpoint
+        (weights_only=True): the same config, weights and input_scale come back,
+        and the file carries activation / k / input_scale as plain scalars, hook"""
+        import datetime
+        from eval import CHECKPOINT_KEYS, load_checkpoint, make_checkpoint
+
+        cfg = self.CONFIGS[1]
+        sae = SparseAutoencoder(cfg)
+        sae.set_input_scale(0.2282)
+        run_config = {"run": "r", "sae": dataclasses.asdict(cfg),
+                      "args": {"eval_tokens": 2_000_000, "eval_batch_seqs": 64,
+                               "adam_betas": (0.9, 0.99)},
+                      "schedule": {"warmup_steps": 1000}}
+        ckpt = make_checkpoint(
+            sae, layer=8, hook_name="blocks.8.hook_resid_post",
+            run_config=run_config, training_history={"step": [1], "loss": [0.5]},
+            train_shard=_meta(doc_range=(10, 20)), device="cpu",
+        )
+        assert set(ckpt) == set(CHECKPOINT_KEYS)
+        path = tmp_path / "ckpt.pt"
+        torch.save(ckpt, path)
+        loaded, back = load_checkpoint(str(path), "cpu")
+        assert loaded.config == cfg and not loaded.training
+        assert loaded.input_scale.item() == pytest.approx(0.2282)
+        assert torch.equal(loaded.W_dec, sae.W_dec) and torch.equal(loaded.W_enc, sae.W_enc)
+        assert back["input_scale"] == pytest.approx(0.2282)
+        assert back["activation"] == "topk" and back["k"] == 32
+        assert back["layer"] == 8 and back["hook_name"] == "blocks.8.hook_resid_post"
+        assert back["torch_version"] == torch.__version__
+        assert back["gpu_name"] is None and back["device"] == "cpu"
+        sha = back["git_sha"]
+        assert sha is None or (len(sha) == 40 and all(c in "0123456789abcdef" for c in sha))
+        assert datetime.datetime.fromisoformat(back["created_at"]).tzinfo is not None
+        assert back["run_config"]["args"]["eval_batch_seqs"] == 64
+        assert back["training_history"]["loss"] == [0.5]
+        assert back["train_shard"]["doc_range"] == [10, 20]
+        # an older checkpoint (no provenance keys) still loads
+        torch.save({"sae_state_dict": sae.state_dict(),
+                    "config": dataclasses.asdict(cfg), "layer": 8}, path)
+        old, old_ckpt = load_checkpoint(str(path), "cpu")
+        assert old.config == cfg and old_ckpt.get("git_sha") is None
+
+
+class TestReproducibility:
+    def test_compare_metrics(self):
+        """floats within tol pass, beyond it fail with a readable line; ints / bools
+        / strings must be equal; NaN equals NaN; missing keys are reported."""
+        from eval import METRIC_KEYS, compare_metrics
+
+        ref = {k: 0.5 for k in METRIC_KEYS}
+        ref.update(n_tokens=1000, n_seqs=8, n_dead_eval=3, exclude_bos=True,
+                   identity=False, hook_name="blocks.8.hook_resid_post")
+        assert compare_metrics(ref, dict(ref)) == []
+        close = dict(ref, fvu=0.5 + 5e-5, ce_recon=0.5 - 9e-5)
+        assert compare_metrics(ref, close) == []
+        assert compare_metrics(ref, close, tol=1e-6) != []
+        far = dict(ref, fvu=0.5 + 2e-4, n_tokens=1001, exclude_bos=False,
+                   hook_name="blocks.7.hook_resid_post")
+        problems = compare_metrics(ref, far)
+        assert len(problems) == 4
+        assert any(p.startswith("fvu:") and "> 0.0001" in p for p in problems)
+        assert any(p.startswith("n_tokens:") for p in problems)
+        assert any(p.startswith("exclude_bos:") for p in problems)
+        assert any(p.startswith("hook_name:") for p in problems)
+        nan_ref = dict(ref, loss_recovered=float("nan"))
+        assert compare_metrics(nan_ref, dict(nan_ref)) == []
+        assert compare_metrics(nan_ref, ref) != []
+        missing = dict(ref)
+        del missing["l0"]
+        assert compare_metrics(ref, missing) == ["l0: missing from actual"]
+
+    def test_fp32_matmul_context_restores_flags(self):
+        """the TF32 guard evaluate runs under: flags off inside, restored after (a
+        no-op without CUDA)."""
+        from eval import fp32_matmul
+
+        prev = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+        with fp32_matmul():
+            if torch.cuda.is_available():
+                assert not torch.backends.cuda.matmul.allow_tf32
+                assert not torch.backends.cudnn.allow_tf32
+        assert (torch.backends.cuda.matmul.allow_tf32,
+                torch.backends.cudnn.allow_tf32) == prev
+
+    def test_eval_cli_reproduces_main_metrics_json(self, tmp_path, tiny_model, loader_shard,
+                                                   monkeypatch, capsys):
+        """the reproducibility contract on the hermetic tiny model: main.main
+        trains, saves the checkpoint and writes metrics.json."""
+        import eval as eval_mod
+        import main
+        from eval import METRIC_KEYS
+
+        monkeypatch.setattr(main.HookedTransformer, "from_pretrained",
+                            classmethod(lambda cls, *a, **k: tiny_model))
+        monkeypatch.setattr(main, "load_forward_model", lambda backend, device: tiny_model)
+        monkeypatch.setattr(main, "TARGET_LAYER", 1)
+        results = tmp_path / "results"
+        cfg = tmp_path / "c.json"
+        cfg.write_text(json.dumps({
+            "name": "repro", "activation": "relu", "l1_coeff": 2.5e-3,
+            "expansion": 4, "n_tokens": 2000, "batch_tokens": 128, "buffer_tokens": 512,
+            "batch_seqs": 8, "calibration_tokens": 256, "eval_tokens": 500,
+            "eval_batch_seqs": 8, "log_interval": 2, "device": "cpu",
+            "no_analysis": True, "train_shard": str(loader_shard.path),
+            "holdout_shard": str(loader_shard.path), "results_dir": str(results),
+            "checkpoint": str(results / "repro" / "checkpoint.pt"),
+        }))
+        main.main(["--config-json", str(cfg)])
+        d = results / "repro"
+        record = json.load(open(d / "metrics.json"))
+        recorded = record["metrics"]
+        assert recorded is not None and recorded["n_tokens"] == 3 * 248
+        # warmup / resample were derived (15 steps -> 1 / 1) and recorded
+        assert record["config"]["schedule"]["warmup_steps"] == 1
+        assert record["config"]["schedule"]["resample_interval"] == 1
+        capsys.readouterr()
+
+        out_json = tmp_path / "again.json"
+        eval_mod.main(["--checkpoint", str(d / "checkpoint.pt"),
+                       "--holdout", str(loader_shard.path),
+                       "--compare", str(d / "metrics.json"),
+                       "--json", str(out_json), "--device", "cpu"])
+        printed = capsys.readouterr().out
+        assert "reproduces" in printed and ": OK" in printed
+        # batch_seqs / n_tokens came from the checkpoint, not the CLI defaults
+        assert "batches of 8 rows" in printed and "first 500 tokens" in printed
+        again = json.load(open(out_json))
+        for key in METRIC_KEYS:
+            r, a = recorded[key], again[key]
+            if isinstance(r, float):
+                assert abs(r - a) <= 1e-4, (key, r, a)
+            else:
+                assert r == a, key
+
+        tampered = dict(record, metrics=dict(recorded, fvu=recorded["fvu"] + 1e-3))
+        json.dump(tampered, open(d / "tampered.json", "w"))
+        with pytest.raises(SystemExit) as exc:
+            eval_mod.main(["--checkpoint", str(d / "checkpoint.pt"),
+                           "--holdout", str(loader_shard.path),
+                           "--compare", str(d / "tampered.json"), "--device", "cpu"])
+        assert exc.value.code == 1
+        assert "MISMATCH" in capsys.readouterr().out
+        # a record with metrics: null (no held-out shard) cannot be compared
+        json.dump(dict(record, metrics=None), open(d / "null.json", "w"))
+        with pytest.raises(SystemExit, match="no metrics to compare"):
+            eval_mod.main(["--checkpoint", str(d / "checkpoint.pt"),
+                           "--holdout", str(loader_shard.path),
+                           "--compare", str(d / "null.json"), "--device", "cpu"])
 
 
 class TestSweep:

@@ -1,0 +1,64 @@
+{
+  "run": "a6_default",
+  "sae": {
+    "d_model": 768,
+    "n_features": 6144,
+    "l1_coefficient": 0.005,
+    "lr": 0.0004,
+    "warmup_steps": 976,
+    "normalize_decoder": true,
+    "normalize_input": true,
+    "activation": "relu",
+    "k": null,
+    "aux_k": 0,
+    "aux_coeff": 0.0,
+    "adam_betas": [
+      0.9,
+      0.99
+    ]
+  },
+  "layer": 8,
+  "hook_name": "blocks.8.hook_resid_post",
+  "device": "cuda",
+  "args": {
+    "config_json": null,
+    "train_shard": "data/train.bin",
+    "holdout_shard": "data/holdout.bin",
+    "n_tokens": 200000000,
+    "batch_seqs": 256,
+    "batch_tokens": 4096,
+    "buffer_tokens": 2000000,
+    "calibration_tokens": 100000,
+    "eval_tokens": 2000000,
+    "eval_batch_seqs": 64,
+    "run_name": "a6_default",
+    "results_dir": "results",
+    "seed": 42,
+    "device": null,
+    "checkpoint": "sae_gpt2_layer8.pt",
+    "no_analysis": false,
+    "analysis_dataset": "monology/pile-uncopyrighted",
+    "no_autocast": false,
+    "activation": "relu",
+    "k": 32,
+    "l1_coeff": 0.005,
+    "expansion": 8.0,
+    "lr": 0.0004,
+    "adam_betas": [
+      0.9,
+      0.99
+    ],
+    "warmup_steps": null,
+    "resample_interval": null,
+    "log_interval": null,
+    "aux_k": 0,
+    "aux_coeff": 0.0,
+    "forward": "hf"
+  },
+  "schedule": {
+    "warmup_steps": 976,
+    "resample_interval": 6103,
+    "log_interval": 6
+  },
+  "started_at": "2026-05-16T17:16:19+00:00"
+}

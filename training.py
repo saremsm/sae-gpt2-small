@@ -24,11 +24,14 @@ class ActivationSource(Protocol):
         ...
 
 
-# Default SAE batch (activations per optimizer step)
-BATCH_SIZE = 512
+# Default SAE batch (activations per optimizer step) - the loader's
+# batch_tokens; main.py, bench_pipeline.py and profile_sae.py expose it as
+# --batch-tokens.
+BATCH_SIZE = 4096
 RENORM_INTERVAL = 100
-# batches feeding the resampling pool. 8 x 512 x 768 fp32 ~ 12 MB, kept on the
-# training device (a per-step .cpu() would sync every step).
+# batches feeding the resampling pool. 8 x 4096 x 768 fp32 ~ 100 MB (12 MB at
+# batch 512), kept on the training device (a per-step .cpu() would sync every
+# step).
 RESAMPLE_POOL_BATCHES = 8
 
 
@@ -71,7 +74,7 @@ def train_step(
 def train_sae(
     sae: SparseAutoencoder,
     loader: ActivationSource,
-    n_training_tokens: int = 5_000_000,
+    n_training_tokens: int = 200_000_000,
     resample_interval: int = 5_000,
     log_interval: int = 100,
     device: str = "cpu",
@@ -79,7 +82,8 @@ def train_sae(
     calibration_tokens: int = 100_000,
     log_jsonl: str | Path | None = None,
 ) -> TrainingHistory:
-    """Train `sae` on raw residual batches from `loader`."""
+    """Train `sae` on raw residual batches from `loader`. The optimizer is
+    AdamW(lr=config.lr, betas=config.adam_betas, no weight decay)."""
     torch.manual_seed(seed)
     if device == "cuda":
         torch.cuda.manual_seed_all(seed)
@@ -91,7 +95,9 @@ def train_sae(
         weight_decay=0.0,
     )
 
-    # Guard a silent failure: the original warmup_steps=1000 vs ~976-step run
+    # Guard a silent failure: an early run had warmup_steps=1000 against ~976
+    # total steps and never left LR warmup. main.py now derives warmup as 2% of
+    # the run.
     batch_tokens = loader.batch_tokens
     expected_steps = max(1, n_training_tokens // batch_tokens)
     warmup_steps = sae.config.warmup_steps

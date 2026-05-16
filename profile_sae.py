@@ -1,5 +1,6 @@
-"""profile one SAE training step: forward + backward + project_decoder_grad +
-optimizer.step under torch.profiler; top ops by self-CUDA-time."""
+"""profile one SAE training step - training.train_step, the same function train_sae
+and bench_pipeline.py run: forward + backward + decoder-gradient projection +
+grad clipping + optimizer.step - under torch.profiler; top ops by self-CUDA-time."""
 
 from __future__ import annotations
 
@@ -10,17 +11,17 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.optim import AdamW
 
 from sparse_autoencoder import SAEConfig, SparseAutoencoder
+from training import BATCH_SIZE, train_step
 
 
 WARMUP_STEPS = 5
 PROFILE_STEPS = 20
-BATCH_SIZE = 512
 D_MODEL = 768
-N_FEATURES = 3072
+DEFAULT_EXPANSION = 8.0
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--trace",
         type=str,
@@ -33,40 +34,79 @@ def main() -> None:
         default=15,
         help="Number of rows to print in the summary table",
     )
+    parser.add_argument(
+        "--batch-tokens", type=int, default=BATCH_SIZE,
+        help=f"activations per step (default {BATCH_SIZE}, the default recipe)",
+    )
+    parser.add_argument(
+        "--expansion", type=float, default=DEFAULT_EXPANSION,
+        help="n_features = expansion x 768 (default 8 -> 6144)",
+    )
+    parser.add_argument(
+        "--activation", choices=["relu", "topk"], default="relu",
+        help="encoder variant of the profiled step",
+    )
+    parser.add_argument(
+        "--k", type=int, default=32,
+        help="latents per token under --activation topk",
+    )
+    parser.add_argument(
+        "--aux-k", type=int, default=0,
+        help="AuxK width under topk (0 = off; the sweep used 2k)",
+    )
+    parser.add_argument(
+        "--aux-coeff", type=float, default=0.0,
+        help="AuxK weight (0.03125 = 1/32 in the paper)",
+    )
+    parser.add_argument(
+        "--no-tf32", action="store_true",
+        help="profile the step with TF32 matmuls off (fp32 sgemm); default "
+        "on, as in training (the loader enables TF32 process-wide)",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise SystemExit("Profiler script requires CUDA. Run on a GPU instance.")
 
     device = "cuda"
+    # Same matmul precision as the training step: ActivationLoader sets both
+    torch.backends.cuda.matmul.allow_tf32 = not args.no_tf32
+    torch.backends.cudnn.allow_tf32 = not args.no_tf32
+    n_features = int(round(args.expansion * D_MODEL))
+    is_topk = args.activation == "topk"
     print(f"Profiling on: {torch.cuda.get_device_name(0)}")
     print(
-        f"Config: batch={BATCH_SIZE}, d_model={D_MODEL}, "
-        f"n_features={N_FEATURES} (4x expansion)"
+        f"Config: batch={args.batch_tokens}, d_model={D_MODEL}, "
+        f"n_features={n_features} ({args.expansion:g}x expansion), "
+        f"{args.activation}" + (f" k={args.k}" if is_topk else "")
+        + (f", aux_k={args.aux_k}" if is_topk and args.aux_k else "")
+        + f", tf32={'off' if args.no_tf32 else 'on'}"
     )
 
     cfg = SAEConfig(
         d_model=D_MODEL,
-        n_features=N_FEATURES,
-        l1_coefficient=5e-3,
+        n_features=n_features,
+        l1_coefficient=0.0 if is_topk else SAEConfig.l1_coefficient,
+        activation=args.activation,
+        k=args.k if is_topk else None,
+        aux_k=args.aux_k if is_topk else 0,
+        aux_coeff=args.aux_coeff if is_topk else 0.0,
     )
     sae = SparseAutoencoder(cfg).to(device)
     sae.train()
 
-    optimizer = AdamW(sae.parameters(), lr=2e-4, weight_decay=0.0)
+    optimizer = AdamW(
+        sae.parameters(), lr=cfg.lr, betas=cfg.adam_betas, weight_decay=0.0,
+    )
 
     # raw synthetic activations at roughly layer-8 scale (norm ~166)
-    x = torch.randn(BATCH_SIZE, D_MODEL, device=device) * 6.0
+    x = torch.randn(args.batch_tokens, D_MODEL, device=device) * 6.0
     sae.set_input_scale_from_activations(x)
 
     # warmup: cudnn autotune, allocator caching, lazy init
     print(f"\nWarmup: {WARMUP_STEPS} steps...")
     for _ in range(WARMUP_STEPS):
-        out = sae(x)
-        optimizer.zero_grad()
-        out.loss.backward()
-        sae.project_decoder_grad()
-        optimizer.step()
+        train_step(sae, optimizer, x)
     torch.cuda.synchronize()
 
     print(f"Profiling: {PROFILE_STEPS} steps...\n")
@@ -76,15 +116,7 @@ def main() -> None:
     ) as prof:
         for _ in range(PROFILE_STEPS):
             with record_function("sae_step"):
-                with record_function("forward"):
-                    out = sae(x)
-                with record_function("backward"):
-                    optimizer.zero_grad()
-                    out.loss.backward()
-                with record_function("decoder_grad_projection"):
-                    sae.project_decoder_grad()
-                with record_function("optimizer_step"):
-                    optimizer.step()
+                train_step(sae, optimizer, x)
 
     torch.cuda.synchronize()
 

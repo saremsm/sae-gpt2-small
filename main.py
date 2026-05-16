@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import random
@@ -23,10 +24,17 @@ except ImportError as exc:
     ) from exc
 
 from sparse_autoencoder import SparseAutoencoder, SAEConfig
-from data import ActivationLoader, TokenShard, load_forward_model, resid_post_hook
+from data import (
+    DEFAULT_DATASET,
+    ActivationLoader,
+    TokenShard,
+    load_forward_model,
+    resid_post_hook,
+)
 from training import BATCH_SIZE, train_sae
 from eval import (
     evaluate,
+    make_checkpoint,
     make_run_record,
     print_metrics,
     utc_now_iso,
@@ -42,15 +50,24 @@ from analysis import (
 
 
 TARGET_LAYER = 8
-# Schedule knobs are denominated in TOKENS so a different --batch-tokens keeps
-# the same warmup / resampling / logging cadence per token.
-WARMUP_TOKENS = 51_200
-RESAMPLE_TOKENS = 128_000
+# Training recipe defaults: the frontier sweep's constants.
+DEFAULT_N_TOKENS = 200_000_000
+DEFAULT_EXPANSION = 8.0
+DEFAULT_BUFFER_TOKENS = 2_000_000
+DEFAULT_EVAL_TOKENS = 2_000_000
+# Schedule defaults are derived from the run length (total steps = n_tokens //
+# batch_tokens)
+WARMUP_FRACTION = 0.02
+RESAMPLES_PER_RUN = 8
 LOG_TOKENS = 25_600
 
 # --config-json keys that are spelled differently from the argparse dest.
 CONFIG_JSON_ALIASES = {"name": "run_name", "betas": "adam_betas"}
 DEFAULT_CHECKPOINT = "sae_gpt2_layer8.pt"
+# Corpus the post-training feature analysis draws its texts.
+DEFAULT_ANALYSIS_DATASET = DEFAULT_DATASET
+ANALYSIS_DOCS = 200
+ANALYSIS_TEXTS = 100
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -79,8 +96,10 @@ def build_parser() -> argparse.ArgumentParser:
         "skipped with a warning if the file is missing",
     )
     parser.add_argument(
-        "--n-tokens", type=int, default=500_000,
-        help="training tokens (position-0 rows excluded)",
+        "--n-tokens", type=int, default=DEFAULT_N_TOKENS,
+        help=f"training tokens (position-0 rows excluded); default "
+        f"{DEFAULT_N_TOKENS:,} = the frontier-sweep budget (48,828 steps at "
+        f"batch {BATCH_SIZE})",
     )
     parser.add_argument(
         "--batch-seqs", type=int, default=256,
@@ -88,18 +107,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--batch-tokens", type=int, default=BATCH_SIZE,
-        help="activations per SAE optimizer step. 512 is the recipe every "
-        "numbers row uses (977 steps for 500K tokens; 90K tok/s on the A10). "
-        "2048 clears the A10 throughput gate (107K tok/s) but at 500K tokens "
-        "that is 244 steps at the same lr and the SAE is badly undertrained "
-        "(FVU 0.82 vs 0.63) - use it for long runs (the MVP run-scale token budgets), "
-        "not for the 500K headline. Warmup / resampling / logging cadence is "
-        "token-denominated so it is the same per token at either batch.",
+        help=f"activations per SAE optimizer step (default {BATCH_SIZE}, the "
+        "frontier-sweep batch; clears the A10 throughput gate). Warmup and "
+        "resampling are derived from the resulting step count, so they "
+        "scale with this. The README's history rows ran at 512 with "
+        "lr 2e-4 - re-tune --lr if you change the batch",
     )
     parser.add_argument(
-        "--buffer-tokens", type=int, default=1_000_000,
-        help="on-device shuffle buffer size in activations "
-        "(x d_model x 4 bytes of GPU memory)",
+        "--buffer-tokens", type=int, default=DEFAULT_BUFFER_TOKENS,
+        help=f"on-device shuffle buffer size in activations (x d_model x 4 "
+        f"bytes of GPU memory: the default {DEFAULT_BUFFER_TOKENS:,} rows is "
+        "6.1 GB); lower it for CPU / short runs",
     )
     parser.add_argument(
         "--calibration-tokens", type=int, default=100_000,
@@ -107,14 +125,17 @@ def build_parser() -> argparse.ArgumentParser:
         "first step (train_sae; those batches are then trained on)",
     )
     parser.add_argument(
-        "--eval-tokens", type=int, default=2_000_000,
+        "--eval-tokens", type=int, default=DEFAULT_EVAL_TOKENS,
         help="held-out tokens for the post-training evaluation (position-0 "
-        "rows not counted); three fp32 GPT-2 forwards per token",
+        "rows not counted); three fp32 GPT-2 forwards per token. Recorded "
+        "in the checkpoint; `python -m eval` reuses it",
     )
     parser.add_argument(
         "--eval-batch-seqs", type=int, default=64,
         help="rows per GPT-2 forward in the evaluation (fp32 logits are "
-        "b x seq_len x 50257: 64 rows ~ 1.7 GB)",
+        "b x seq_len x 50257: 64 rows ~ 1.7 GB). Part of the reproducibility "
+        "contract (the eval set is cut in whole batches); recorded in the "
+        "checkpoint and reused by `python -m eval`",
     )
     parser.add_argument(
         "--run-name", default=None,
@@ -132,15 +153,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--checkpoint", default=DEFAULT_CHECKPOINT,
-        help="where the trained SAE is saved (state_dict + config + "
-        "training history + train-shard sidecar); sweep.py sets "
-        "results/<run>/checkpoint.pt",
+        help="where the trained SAE is saved (eval.make_checkpoint: "
+        "state_dict incl. input_scale, config, layer / hook, git SHA, torch "
+        "version, GPU name, the resolved run config, training history, "
+        "train-shard sidecar); sweep.py sets results/<run>/checkpoint.pt",
     )
     parser.add_argument(
         "--no-analysis", action="store_true",
-        help="skip the feature analysis after training (it downloads "
-        "NeelNanda/pile-10k and runs the SAE over 100 texts); sweep.py "
-        "sets this",
+        help="skip the feature analysis after training (it streams "
+        f"{ANALYSIS_TEXTS} texts from --analysis-dataset and runs the SAE "
+        "over them); sweep.py sets this",
+    )
+    parser.add_argument(
+        "--analysis-dataset", default=DEFAULT_ANALYSIS_DATASET,
+        help=f"HF text dataset the feature analysis streams its first "
+        f"{ANALYSIS_DOCS} documents from (train split, unshuffled); default "
+        f"{DEFAULT_ANALYSIS_DATASET}, the shard corpus",
     )
     parser.add_argument(
         "--no-autocast", action="store_true",
@@ -164,39 +192,42 @@ def build_parser() -> argparse.ArgumentParser:
         "topk); 5e-3 is the numbers-table recipe",
     )
     parser.add_argument(
-        "--expansion", type=float, default=4.0,
+        "--expansion", type=float, default=DEFAULT_EXPANSION,
         help="dictionary size as a multiple of d_model: n_features = "
-        "expansion x 768 (4 -> 3072, the recipe; 8 -> 6144; 16 -> 12288)",
+        "expansion x 768 (4 -> 3072; 8 -> 6144, the default; 16 -> 12288)",
     )
     parser.add_argument(
-        "--lr", type=float, default=2e-4,
-        help="AdamW learning rate after warmup (2e-4 is the numbers-table "
-        "recipe at batch 512; the frontier sweep uses 4e-4 at 4096)",
+        "--lr", type=float, default=SAEConfig.lr,
+        help=f"AdamW learning rate after warmup (default {SAEConfig.lr:g}, "
+        "the frontier-sweep recipe at batch 4096; the numbers-table "
+        "history rows used 2e-4 at batch 512)",
     )
     parser.add_argument(
-        "--adam-betas", type=float, nargs=2, default=(0.9, 0.999),
+        "--adam-betas", type=float, nargs=2, default=SAEConfig.adam_betas,
         metavar=("B1", "B2"),
-        help="AdamW betas (default torch's 0.9 0.999; the sweep uses "
-        "0.9 0.99)",
+        help=f"AdamW betas (default {SAEConfig.adam_betas[0]:g} "
+        f"{SAEConfig.adam_betas[1]:g}, the sweep recipe; the history rows "
+        "used torch's 0.9 0.999)",
     )
     parser.add_argument(
         "--warmup-steps", type=int, default=None,
-        help="LR warmup in optimizer steps; default is token-denominated "
-        f"({WARMUP_TOKENS:,} tokens = 100 steps at batch 512, 12 at 4096 "
-        "- set it explicitly for large-batch runs)",
+        help="LR warmup in optimizer steps; default is derived: "
+        f"{100 * WARMUP_FRACTION:g}%% of the total steps (n_tokens // "
+        "batch_tokens; 976 at the default recipe)",
     )
     parser.add_argument(
         "--resample-interval", type=int, default=None,
         help="dead-feature resampling / counting-window length in "
-        f"optimizer steps; default is token-denominated ({RESAMPLE_TOKENS:,} "
-        "tokens = 250 steps at 512, 31 at 4096). This is also the window "
-        "in which a feature must fire to count as alive",
+        "optimizer steps; default is derived: total steps // "
+        f"{RESAMPLES_PER_RUN}, so resampling fires {RESAMPLES_PER_RUN} times "
+        "per run (6103 steps = 25.0M tokens at the default recipe). This is "
+        "also the window in which a feature must fire to count as alive",
     )
     parser.add_argument(
         "--log-interval", type=int, default=None,
         help="history / train_log.jsonl cadence in optimizer steps; default "
-        f"is token-denominated ({LOG_TOKENS:,} tokens = 50 steps at 512, 6 "
-        "at 4096)",
+        f"is token-denominated ({LOG_TOKENS:,} tokens = 6 steps at batch "
+        "4096, 50 at 512)",
     )
     parser.add_argument(
         "--aux-k", type=int, default=0,
@@ -283,21 +314,40 @@ def sae_config_from_args(args: argparse.Namespace, d_model: int) -> SAEConfig:
     )
 
 
+def total_steps(n_tokens: int, batch_tokens: int) -> int:
+    """Optimizer steps a run of n_tokens at batch_tokens takes."""
+    if batch_tokens < 1:
+        raise SystemExit(f"--batch-tokens must be >= 1, got {batch_tokens}")
+    return max(1, n_tokens // batch_tokens)
+
+
+def default_schedule(n_tokens: int, batch_tokens: int) -> dict:
+    """The derived schedule for a run: warmup_steps = WARMUP_FRACTION of the total
+    steps."""
+    steps = total_steps(n_tokens, batch_tokens)
+    return {
+        "warmup_steps": max(1, int(WARMUP_FRACTION * steps)),
+        "resample_interval": max(1, steps // RESAMPLES_PER_RUN),
+        "log_interval": max(1, LOG_TOKENS // batch_tokens),
+    }
+
+
 def schedule_from_args(args: argparse.Namespace) -> dict:
-    """warmup_steps / resample_interval / log_interval in optimizer steps: the
-    token-denominated defaults (WARMUP_TOKENS / RESAMPLE_TOKENS / LOG_TOKENS over
-    batch_tokens) unless --warmup-steps / --resample-interval / --log-interval."""
+    """warmup_steps / resample_interval / log_interval in optimizer steps:
+    default_schedule(n_tokens, batch_tokens) unless --warmup-steps / --resample-
+    interval / --log-interval override them (the sweep files pin all three)."""
+    derived = default_schedule(args.n_tokens, args.batch_tokens)
     warmup = (
         args.warmup_steps if args.warmup_steps is not None
-        else max(10, WARMUP_TOKENS // args.batch_tokens)
+        else derived["warmup_steps"]
     )
     resample = (
         args.resample_interval if args.resample_interval is not None
-        else max(1, RESAMPLE_TOKENS // args.batch_tokens)
+        else derived["resample_interval"]
     )
     log = (
         args.log_interval if args.log_interval is not None
-        else max(1, LOG_TOKENS // args.batch_tokens)
+        else derived["log_interval"]
     )
     if min(warmup, resample, log) < 1:
         raise SystemExit(
@@ -422,13 +472,13 @@ def main(argv: list[str] | None = None) -> None:
     else:
         forward_model = model
 
-    # Defaults are token-denominated: warmup 51.2K tokens (100 steps at 512) vs
-    # ~976 steps at 512 - the previous 1000-step warmup kept the whole run inside
-    # warmup (train_sae also warn-clamps)
+    # Defaults are derived from the run length (default_schedule): warmup 2% of
+    # the steps, resampling 8 times per run.
     schedule = schedule_from_args(args)
     warmup_steps = schedule["warmup_steps"]
     resample_interval = schedule["resample_interval"]
     log_interval = schedule["log_interval"]
+    n_steps = total_steps(args.n_tokens, args.batch_tokens)
     config = sae_config_from_args(args, model.cfg.d_model)
     is_topk = args.activation == "topk"
     if not is_topk and (args.aux_k or args.aux_coeff):
@@ -437,10 +487,12 @@ def main(argv: list[str] | None = None) -> None:
             "ignored."
         )
     print(
-        f"Schedule: batch_tokens={args.batch_tokens}, warmup {warmup_steps} steps "
-        f"({warmup_steps * args.batch_tokens:,} tok), resample every "
-        f"{resample_interval} steps ({resample_interval * args.batch_tokens:,} "
-        f"tok), log every {log_interval} steps"
+        f"Schedule: batch_tokens={args.batch_tokens} ({n_steps:,} steps), "
+        f"warmup {warmup_steps} steps ({warmup_steps * args.batch_tokens:,} "
+        f"tok), resample every {resample_interval} steps "
+        f"({resample_interval * args.batch_tokens:,} tok, "
+        f"{n_steps // resample_interval}x per run), log every {log_interval} "
+        f"steps"
     )
 
     sae = SparseAutoencoder(config)
@@ -505,20 +557,18 @@ def main(argv: list[str] | None = None) -> None:
 
     checkpoint_path = args.checkpoint
     os.makedirs(os.path.dirname(os.path.abspath(checkpoint_path)), exist_ok=True)
-    # plain-dict config: loads under torch.load's safe weights_only=True.
-    torch.save(
-        {
-            "sae_state_dict": sae.state_dict(),
-            "config": asdict(config),
-            "layer": TARGET_LAYER,
-            "training_history": history,
-            "train_shard": train_shard.meta,
-        },
-        checkpoint_path,
+    # Saved BEFORE the evaluation.
+    checkpoint = make_checkpoint(
+        sae, layer=TARGET_LAYER, hook_name=hook_name, run_config=run_config,
+        training_history=history, train_shard=train_shard.meta,
+        device=device,
     )
+    torch.save(checkpoint, checkpoint_path)
     print(
         f"\nModel saved to '{checkpoint_path}' "
-        f"(input_scale={sae.input_scale.item():.5f})"
+        f"(input_scale={sae.input_scale.item():.5f}, git "
+        f"{checkpoint['git_sha'] or '?'}, torch {checkpoint['torch_version']}, "
+        f"gpu {checkpoint['gpu_name'] or 'none'})"
     )
 
     plot_training_history(history, os.path.join(run_dir, "training_history.png"))
@@ -563,23 +613,30 @@ def main(argv: list[str] | None = None) -> None:
             "loader_tok_s": loader.throughput_tok_s(),
             "train_wall_seconds": train_wall,
         },
+        device=device,
     )
     metrics_path = write_json(os.path.join(run_dir, "metrics.json"), record)
     print(f"metrics written to {metrics_path}")
     if metrics is None:
         print("(no held-out shard: metrics is null in metrics.json)")
+    else:
+        print(
+            f"Reproduce them from the checkpoint with:\n  python -m eval "
+            f"--checkpoint {checkpoint_path} --holdout {holdout_shard} "
+            f"--n-tokens {args.eval_tokens} --compare {metrics_path}"
+        )
 
     if args.no_analysis:
         print("\n--no-analysis: skipping the feature analysis.")
         return
 
-    print("\nLoading analysis texts...")
-    dataset = load_dataset("NeelNanda/pile-10k", split="train")
+    print(f"\nLoading analysis texts ({args.analysis_dataset}, streamed)...")
+    dataset = load_dataset(args.analysis_dataset, split="train", streaming=True)
     analysis_texts = [
         item.get("text", "")
-        for item in list(dataset)[:200]
+        for item in itertools.islice(dataset, ANALYSIS_DOCS)
         if len(item.get("text", "")) > 100
-    ][:100]
+    ][:ANALYSIS_TEXTS]
     print(f"Loaded {len(analysis_texts)} texts for analysis.")
 
     print("Building activation cache (one model forward pass per text)...")

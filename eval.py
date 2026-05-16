@@ -6,11 +6,14 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import math
 import os
 import subprocess
 import time
+from contextlib import contextmanager
+from dataclasses import asdict
 from pathlib import Path
-from typing import Callable, TYPE_CHECKING
+from typing import Callable, Iterator, TYPE_CHECKING
 
 import torch
 
@@ -49,11 +52,35 @@ RUN_RECORD_KEYS: tuple[str, ...] = (
     "started_at",
     "finished_at",
     "git_sha",
+    "torch_version",
+    "gpu_name",
     "train_shard",
     "holdout_shard",
     "checkpoint",
     "training",
 )
+
+# Keys of a main.py checkpoint (make_checkpoint / load_checkpoint).
+CHECKPOINT_KEYS: tuple[str, ...] = (
+    "sae_state_dict",
+    "config",
+    "layer",
+    "hook_name",
+    "input_scale",
+    "activation",
+    "k",
+    "git_sha",
+    "torch_version",
+    "gpu_name",
+    "device",
+    "created_at",
+    "run_config",
+    "training_history",
+    "train_shard",
+)
+
+# Default tolerance of the reproducibility check (`python -m eval --compare`)
+COMPARE_TOL = 1e-4
 
 
 # Shard disjointness
@@ -116,6 +143,26 @@ class _StreamingMoments:
 
 
 # Evaluation
+
+
+@contextmanager
+def fp32_matmul() -> Iterator[None]:
+    """Disable TF32 matmuls (torch.backends.cuda.matmul / cudnn allow_tf32) for the
+    block and restore the previous flags after. data.ActivationLoader enables."""
+    if not torch.cuda.is_available():
+        yield
+        return
+    prev = (
+        torch.backends.cuda.matmul.allow_tf32,
+        torch.backends.cudnn.allow_tf32,
+    )
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev[0]
+        torch.backends.cudnn.allow_tf32 = prev[1]
 
 
 def _positions_slice(exclude_bos: bool) -> slice:
@@ -206,7 +253,7 @@ def evaluate(
 
     t0 = time.perf_counter()
     n_batches = 0
-    with torch.no_grad():
+    with torch.no_grad(), fp32_matmul():
         for tokens in holdout.iter_batches(batch_seqs, shuffle=False, epochs=1):
             tokens = tokens.to(device)
             s, n_pos = run_loss(tokens, [(hook_name, recon_hook)])
@@ -308,6 +355,24 @@ def utc_now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
 
 
+def torch_version() -> str:
+    return str(torch.__version__)
+
+
+def gpu_name(device: str | torch.device | None) -> str | None:
+    """torch.cuda.get_device_name of `device` when it is a CUDA device and CUDA is
+    available; None otherwise (cpu / mps / no device)."""
+    if device is None:
+        return None
+    dev = torch.device(device)
+    if dev.type != "cuda" or not torch.cuda.is_available():
+        return None
+    try:
+        return torch.cuda.get_device_name(dev)
+    except (RuntimeError, AssertionError):
+        return None
+
+
 def make_run_record(
     run: str,
     config: dict,
@@ -318,8 +383,11 @@ def make_run_record(
     holdout_shard: dict | None = None,
     checkpoint: str | None = None,
     training: dict | None = None,
+    device: str | None = None,
 ) -> dict:
-    """Assemble the metrics.json content: config (SAEConfig + CLI args)"""
+    """Assemble the metrics.json content: config (SAEConfig + CLI args), every
+    `evaluate` metric (None when the evaluation was skipped, e.g. no held-out
+    shard), ISO-8601 UTC timestamps, git SHA (None when unavailable)"""
     if metrics is not None:
         missing = [k for k in METRIC_KEYS if k not in metrics]
         if missing:
@@ -331,11 +399,76 @@ def make_run_record(
         "started_at": started_at,
         "finished_at": finished_at or utc_now_iso(),
         "git_sha": git_sha(),
+        "torch_version": torch_version(),
+        "gpu_name": gpu_name(device),
         "train_shard": train_shard,
         "holdout_shard": holdout_shard,
         "checkpoint": checkpoint,
         "training": training,
     }
+
+
+def make_checkpoint(
+    sae: SparseAutoencoder,
+    layer: int,
+    hook_name: str,
+    run_config: dict | None = None,
+    training_history: dict | None = None,
+    train_shard: dict | None = None,
+    device: str | None = None,
+) -> dict:
+    """The dict main.py torch.save()s (CHECKPOINT_KEYS): the SAE state_dict (which
+    carries the input_scale buffer), the config as a plain dict (asdict, so
+    torch.load(weights_only=True) works), the layer and hook name."""
+    config = sae.config
+    return {
+        "sae_state_dict": sae.state_dict(),
+        "config": asdict(config),
+        "layer": int(layer),
+        "hook_name": hook_name,
+        "input_scale": float(sae.input_scale.item()),
+        "activation": config.activation,
+        "k": config.k,
+        "git_sha": git_sha(),
+        "torch_version": torch_version(),
+        "gpu_name": gpu_name(device),
+        "device": None if device is None else str(device),
+        "created_at": utc_now_iso(),
+        "run_config": None if run_config is None else dict(run_config),
+        "training_history": training_history,
+        "train_shard": train_shard,
+    }
+
+
+def compare_metrics(
+    reference: dict, actual: dict, tol: float = COMPARE_TOL
+) -> list[str]:
+    """Mismatches between two `evaluate` dicts, one string per METRIC_KEY that
+    differs: floats beyond `tol` (absolute; NaN equals NaN), ints / bools /
+    strings not equal, keys missing from either side."""
+    problems: list[str] = []
+    for key in METRIC_KEYS:
+        if key not in reference or key not in actual:
+            side = "reference" if key not in reference else "actual"
+            problems.append(f"{key}: missing from {side}")
+            continue
+        r, a = reference[key], actual[key]
+        if isinstance(r, bool) or isinstance(a, bool) or isinstance(r, str):
+            if r != a:
+                problems.append(f"{key}: {r!r} != {a!r}")
+        elif isinstance(r, int) and isinstance(a, int):
+            if r != a:
+                problems.append(f"{key}: {r} != {a}")
+        else:
+            r_f, a_f = float(r), float(a)
+            if math.isnan(r_f) and math.isnan(a_f):
+                continue
+            if not abs(r_f - a_f) <= tol:
+                problems.append(
+                    f"{key}: recorded {r_f:.6g}, got {a_f:.6g} "
+                    f"(|diff| {abs(r_f - a_f):.3g} > {tol:g})"
+                )
+    return problems
 
 
 def write_json(path: str | Path, obj: dict) -> Path:
@@ -361,6 +494,18 @@ def load_checkpoint(path: str, device: str) -> tuple[SparseAutoencoder, dict]:
     return sae, ckpt
 
 
+def _checkpoint_arg(ckpt: dict, name: str):
+    """A main.py CLI value the checkpoint recorded (run_config.args), or None when
+    the checkpoint predates run_config."""
+    run_config = ckpt.get("run_config")
+    if not isinstance(run_config, dict):
+        return None
+    args = run_config.get("args")
+    if not isinstance(args, dict):
+        return None
+    return args.get(name)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="python -m eval", description=__doc__,
@@ -374,15 +519,28 @@ def main(argv: list[str] | None = None) -> None:
         help="training shard whose sidecar to check for document overlap; "
         "default: the sidecar stored in the checkpoint, if any",
     )
-    parser.add_argument("--n-tokens", type=int, default=2_000_000)
-    parser.add_argument("--batch-seqs", type=int, default=64,
-                        help="rows per GPT-2 forward (logits are "
-                        "b x seq_len x 50257 fp32: 64 rows ~ 1.7 GB)")
+    parser.add_argument("--n-tokens", type=int, default=None,
+                        help="held-out tokens to evaluate (position 0 not "
+                        "counted); default: the eval_tokens the checkpoint "
+                        "recorded, else 2,000,000")
+    parser.add_argument("--batch-seqs", type=int, default=None,
+                        help="rows per GPT-2 forward (logits are b x seq_len "
+                        "x 50257 fp32: 64 rows ~ 1.7 GB); default: the "
+                        "eval_batch_seqs the checkpoint recorded, else 64. "
+                        "Part of the reproducibility contract - the eval "
+                        "set is cut in whole batches")
     parser.add_argument("--identity", action="store_true",
                         help="splice the raw activation back instead of the "
                         "reconstruction: loss_recovered must be 1, fvu 0")
     parser.add_argument("--include-bos", action="store_true",
                         help="also splice / evaluate position 0 (diagnostic)")
+    parser.add_argument("--compare", default=None, metavar="METRICS_JSON",
+                        help="a results/<run>/metrics.json (or a bare metrics "
+                        "dict written by --json): check that this evaluation "
+                        "reproduces its numbers within --tol and exit 1 if not")
+    parser.add_argument("--tol", type=float, default=COMPARE_TOL,
+                        help=f"absolute tolerance for --compare (default "
+                        f"{COMPARE_TOL:g})")
     parser.add_argument("--json", default=None,
                         help="also write the metrics dict to this path")
     parser.add_argument("--device", default=None,
@@ -394,9 +552,26 @@ def main(argv: list[str] | None = None) -> None:
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     sae, ckpt = load_checkpoint(args.checkpoint, device)
-    hook_name = resid_post_hook(int(ckpt["layer"]))
+    hook_name = ckpt.get("hook_name") or resid_post_hook(int(ckpt["layer"]))
     print(f"Checkpoint {args.checkpoint}: {sae.config.n_features} features, "
-          f"{hook_name}, input_scale={sae.input_scale.item():.5f}")
+          f"{sae.config.activation}"
+          + (f" k={sae.config.k}" if sae.config.k is not None else "")
+          + f", {hook_name}, input_scale={sae.input_scale.item():.5f}")
+    print(f"  trained with : git {ckpt.get('git_sha') or '?'}, torch "
+          f"{ckpt.get('torch_version') or '?'}, gpu "
+          f"{ckpt.get('gpu_name') or 'none/unknown'}"
+          + (f", {ckpt['created_at']}" if ckpt.get("created_at") else ""))
+    print(f"  evaluating on: git {git_sha() or '?'}, torch {torch_version()}, "
+          f"gpu {gpu_name(device) or 'none'}")
+
+    n_tokens = args.n_tokens
+    if n_tokens is None:
+        n_tokens = _checkpoint_arg(ckpt, "eval_tokens") or 2_000_000
+    batch_seqs = args.batch_seqs
+    if batch_seqs is None:
+        batch_seqs = _checkpoint_arg(ckpt, "eval_batch_seqs") or 64
+    print(f"Eval set             : first {n_tokens:,} tokens in batches of "
+          f"{batch_seqs} rows")
 
     holdout = TokenShard(args.holdout)
     train_meta: dict | None = None
@@ -410,24 +585,44 @@ def main(argv: list[str] | None = None) -> None:
 
     model = HookedTransformer.from_pretrained("gpt2", device=device).eval()
     metrics = evaluate(
-        sae, model, holdout, hook_name, n_tokens=args.n_tokens,
-        batch_seqs=args.batch_seqs, device=device,
+        sae, model, holdout, hook_name, n_tokens=n_tokens,
+        batch_seqs=batch_seqs, device=device,
         exclude_bos=not args.include_bos, identity=args.identity,
         train_meta=train_meta,
     )
     print(f"Eval shard           : {args.holdout}")
     print_metrics(metrics, sae.input_scale.item())
+    ok = True
     if args.identity:
         ok = (
             abs(metrics["loss_recovered"] - 1.0) <= 1e-3
             and abs(metrics["fvu"]) <= 1e-6
         )
         print(f"identity check       : {'OK' if ok else 'FAILED'}")
-        if not ok:
-            raise SystemExit(1)
     if args.json:
         write_json(args.json, metrics)
         print(f"metrics written to {args.json}")
+    if args.compare is not None:
+        with open(args.compare) as f:
+            record = json.load(f)
+        # a run record (metrics.json) or a bare metrics dict (--json).
+        reference = record.get("metrics") if "run" in record else record
+        if not isinstance(reference, dict):
+            raise SystemExit(
+                f"{args.compare}: no metrics to compare against (the run "
+                f"was evaluated without a held-out shard?)"
+            )
+        problems = compare_metrics(reference, metrics, tol=args.tol)
+        if problems:
+            print(f"reproduces {args.compare}: MISMATCH (tol {args.tol:g})")
+            for line in problems:
+                print(f"  {line}")
+            ok = False
+        else:
+            print(f"reproduces {args.compare}: OK (every metric within "
+                  f"{args.tol:g})")
+    if not ok:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

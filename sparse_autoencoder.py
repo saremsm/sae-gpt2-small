@@ -15,8 +15,10 @@ class SAEConfig:
     d_model: int
     n_features: int
     l1_coefficient: float = 5e-3
-    lr: float = 2e-4
-    warmup_steps: int = 100
+    # Optimizer defaults are the frontier recipe: AdamW at 4e-4 after a warmup of
+    # 2% of the run.
+    lr: float = 4e-4
+    warmup_steps: int = 976
     normalize_decoder: bool = True
     # The SAE owns its input contract: raw residuals are multiplied by one.
     normalize_input: bool = True
@@ -31,9 +33,9 @@ class SAEConfig:
     aux_k: int = 0
     aux_coeff: float = 0.0
     # AdamW betas the training loop uses (train_sae passes them to the optimizer).
-    # Default is torch's (0.9, 0.999) - every numbers-table row; the frontier
-    # sweep uses (0.9, 0.99).
-    adam_betas: tuple[float, float] = (0.9, 0.999)
+    # Default (0.9, 0.99) is the frontier-sweep recipe; the README's history rows
+    # used torch's (0.9, 0.999).
+    adam_betas: tuple[float, float] = (0.9, 0.99)
 
     def __post_init__(self) -> None:
         betas = tuple(float(b) for b in self.adam_betas)
