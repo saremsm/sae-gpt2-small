@@ -1,0 +1,20 @@
+{
+  "activation": "relu",
+  "l1_coeff": 0.005,
+  "expansion": 4,
+  "n_tokens": 200000000,
+  "lr": 0.0004,
+  "betas": [
+    0.9,
+    0.99
+  ],
+  "batch_tokens": 4096,
+  "warmup_steps": 1000,
+  "resample_interval": 5000,
+  "seed": 42,
+  "buffer_tokens": 1000000,
+  "no_analysis": true,
+  "run_name": "relu_x4_l1-mid",
+  "results_dir": "results/frontier",
+  "checkpoint": "results/frontier/relu_x4_l1-mid/checkpoint.pt"
+}
