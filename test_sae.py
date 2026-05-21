@@ -2258,6 +2258,28 @@ class TestSweep:
             path.write_text(json.dumps(cfg))
             main.load_config_json(str(path), parser)  # unknown key -> SystemExit
 
+    def test_repo_mvp_config_json_loads_and_resolves(self):
+        """sweeps/mvp.json is a flat main.py --config-json object."""
+        import main
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, "sweeps", "mvp.json")
+        cfg = main.load_config_json(path, main.build_parser())
+        assert cfg["run_name"] == "mvp" and cfg["no_analysis"] is True
+        assert cfg["activation"] == "relu" and cfg["l1_coeff"] == 5e-3
+        assert cfg["expansion"] == 8 and cfg["n_tokens"] == 200_000_000
+        assert cfg["batch_tokens"] == 4096 and cfg["lr"] == 4e-4
+        assert cfg["adam_betas"] == [0.9, 0.99]
+        assert cfg["warmup_steps"] == 1000 and cfg["resample_interval"] == 5000
+        assert cfg["checkpoint"] == "results/mvp/checkpoint.pt"
+        steps = cfg["n_tokens"] // cfg["batch_tokens"]
+        assert cfg["warmup_steps"] < steps
+        assert steps // cfg["resample_interval"] >= 6
+        args = main.parse_args(["--config-json", path])
+        sae_cfg = main.sae_config_from_args(args, 768)
+        assert sae_cfg.n_features == 6144 and sae_cfg.l1_coefficient == 5e-3
+        assert sae_cfg.activation == "relu" and sae_cfg.adam_betas == (0.9, 0.99)
+
     def test_runs_index_skip_force_and_failure(self, tmp_path, stub):
         import sweep
 
@@ -2436,6 +2458,52 @@ class TestPlot:
         # a different cap changes the best-per-width table
         plot.main(["--results", str(results), "--out", str(out), "--max-l0", "70"])
         assert "| 4x | 3072 | topk_x4_k64 |" in (out / "tables.md").read_text(encoding="utf-8")
+
+    def test_load_runs_recurses_into_sweep_subdirs(self, tmp_path):
+        """load_runs finds metrics.json at any depth under --results."""
+        from eval import write_json
+        from plot import load_runs
+
+        root = tmp_path / "results"
+        write_json(root / "a6_default" / "metrics.json",
+                   _fake_metrics_record("a6_default", "relu", 8, 14.0, 0.72, 0.95))
+        write_json(root / "frontier" / "topk_x4_k32" / "metrics.json",
+                   _fake_metrics_record("topk_x4_k32", "topk", 4, 32.0, 0.81, 0.98,
+                                        k=32))
+        write_json(root / "seeds" / "topk_x4_k32_s1" / "metrics.json",
+                   _fake_metrics_record("topk_x4_k32_s1", "topk", 4, 32.0, 0.81,
+                                        0.98, k=32))
+        write_json(root / "frontier" / "no_eval" / "metrics.json",
+                   _fake_metrics_record("no_eval", "relu", 4, 0, 0, 0,
+                                        metrics=False))
+        rows, unevaluated = load_runs(root)
+        assert {r.name for r in rows} == {"a6_default", "topk_x4_k32",
+                                          "topk_x4_k32_s1"}
+        assert unevaluated == ["no_eval"]
+        # pointing --results at one sweep directory still plots it alone
+        rows, unevaluated = load_runs(root / "frontier")
+        assert {r.name for r in rows} == {"topk_x4_k32"}
+        assert unevaluated == ["no_eval"]
+
+    def test_min_tokens_drops_short_runs(self, results, tmp_path):
+        """--min-tokens keeps smoke/debug runs (README sweep notes: their 1-FVU can
+        be negative) off an everything-view plot."""
+        from eval import write_json
+        import plot
+
+        write_json(results / "smoke_run" / "metrics.json",
+                   _fake_metrics_record("smoke_run", "relu", 4, 90.0, -0.27,
+                                        0.63, n_tokens=200_704))
+        out = tmp_path / "figures"
+        plot.main(["--results", str(results), "--out", str(out)])
+        md = (out / "tables.md").read_text(encoding="utf-8")
+        assert "smoke_run" in md  # default keeps it
+        plot.main(["--results", str(results), "--out", str(out),
+                   "--min-tokens", "1000000"])
+        md = (out / "tables.md").read_text(encoding="utf-8")
+        assert "smoke_run" not in md
+        for name, *_ in self.RUNS:  # 200M-token runs all survive
+            assert name in md
 
     def test_empty_results_dir_exits(self, tmp_path):
         import plot

@@ -95,10 +95,10 @@ def load_run(path: str | Path) -> RunRow | None:
 
 def load_runs(results_dir: str | Path) -> tuple[list[RunRow], list[str]]:
     """(rows sorted by expansion, activation, L0; names of runs whose metrics were
-    null) from every results/*/metrics.json."""
+    null) from every metrics.json under results_dir, at any depth."""
     rows: list[RunRow] = []
     unevaluated: list[str] = []
-    for path in sorted(Path(results_dir).glob("*/metrics.json")):
+    for path in sorted(Path(results_dir).rglob("metrics.json")):
         row = load_run(path)
         if row is None:
             unevaluated.append(path.parent.name)
@@ -263,9 +263,21 @@ def main(argv: list[str] | None = None) -> None:
                         help="output directory for frontier.png, ce.png, tables.md")
     parser.add_argument("--max-l0", type=float, default=40.0,
                         help="L0 cap for the best-per-width table (default 40)")
+    parser.add_argument("--min-tokens", type=int, default=0,
+                        help="drop runs trained on fewer tokens than this "
+                        "(default 0 = keep all). Use e.g. 1000000 to keep "
+                        "smoke/debug runs (which can have 1-FVU < 0, README "
+                        "sweep notes) off an everything-view plot of "
+                        "--results results/")
     args = parser.parse_args(argv)
 
     rows, unevaluated = load_runs(args.results)
+    if args.min_tokens > 0:
+        dropped = [r.name for r in rows if r.n_tokens < args.min_tokens]
+        rows = [r for r in rows if r.n_tokens >= args.min_tokens]
+        if dropped:
+            print(f"{len(dropped)} runs under --min-tokens "
+                  f"{args.min_tokens:,} dropped: {', '.join(dropped)}")
     if not rows and not unevaluated:
         raise SystemExit(f"no <run>/metrics.json under {args.results}")
     out = Path(args.out)

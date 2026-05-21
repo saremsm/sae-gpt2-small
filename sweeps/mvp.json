@@ -1,0 +1,28 @@
+{
+    "_notes": [
+        "MVP: one L1 run at the frontier recipe's mid lambda, 8x, 200M tokens - `python main.py --config-json sweeps/mvp.json`. This is a flat main.py --config-json object (not a sweep.py runs list): one run, driven directly.",
+        "The configuration is the frontier's relu_x8_l1-mid cell (and a6_default, which reproduced it): lambda 5e-3 lands L0 ~14 at this budget (README, the frontier sweep/the default recipe). warmup_steps / resample_interval are pinned to the sweep's 1000 / 5000 rather than left to main.py's derived defaults (976 / 6103) so the run is step-for-step the recorded frontier cell; a6_default measured that the derived schedule and the 2M-row buffer reproduce the pinned/1M-row cell anyway.",
+        "checkpoint is pinned to results/mvp/checkpoint.pt so the follow-up `python -m eval --checkpoint results/mvp/checkpoint.pt --holdout data/holdout.bin --n-tokens 2000000` finds it; no_analysis keeps the run headless-quiet (analysis streams 200 documents from HF at the end otherwise).",
+        "Kill point: with the pipeline gate passed, 1-FVU < 0.65 or loss_recovered < 0.85 on the 2M held-out tokens means diagnose before publishing (expected from the recorded cell: 1-FVU ~0.725, loss recovered ~0.953, L0 ~14)."
+    ],
+    "name": "mvp",
+    "activation": "relu",
+    "l1_coeff": 0.005,
+    "expansion": 8,
+    "n_tokens": 200000000,
+    "lr": 0.0004,
+    "betas": [
+        0.9,
+        0.99
+    ],
+    "batch_tokens": 4096,
+    "warmup_steps": 1000,
+    "resample_interval": 5000,
+    "seed": 42,
+    "buffer_tokens": 2000000,
+    "eval_tokens": 2000000,
+    "train_shard": "data/train.bin",
+    "holdout_shard": "data/holdout.bin",
+    "checkpoint": "results/mvp/checkpoint.pt",
+    "no_analysis": true
+}
