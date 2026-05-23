@@ -1,184 +1,418 @@
 # sae-gpt2
 
-A sparse autoencoder for GPT-2-small residual streams. Trains a dictionary, handles dead features by resampling them onto high-error examples, and lets you query what each feature fires on across a corpus. Headline (the frontier sweep frontier sweep, layer 8, 200M tokens, 2M held-out tokens, one A10): TopK k=32 at 4x (3072 features) reaches **1-FVU 0.81, loss recovered 0.98** (CE 3.86 -> 4.05 nats vs 13.81 zero-ablated) at L0 32; at 16x (12288 features) k=64 reaches 1-FVU 0.89, loss recovered 0.99. TopK beats ReLU + L1 at every width and sparsity in the sweep (`figures/frontier.png`, `figures/tables.md`, see numbers). The sweep recipe is the default (default recipe): `python main.py` trains 200M tokens at batch 4096, 8x, lr 4e-4, and every run's `metrics.json` is regenerated from its checkpoint by `python -m eval --compare` (see evaluation). Input scaling - one dataset-wide scalar calibrated from the data - lives inside the SAE and its checkpoint, so the model cannot be mis-used by skipping preprocessing, and reconstructions map back to raw residual space for splicing into the model.
+Sparse autoencoders on the GPT-2-small residual stream at layer 8
+(`blocks.8.hook_resid_post`, d_model 768), in two variants selectable per
+run: ReLU + L1 and TopK (Gao et al. 2024) with optional AuxK. Training
+reads pre-tokenized shards of `monology/pile-uncopyrighted` (220M-token
+train shard, document-disjoint 20K-document held-out shard) through a
+GPU-resident shuffle buffer; the recipe is 200M tokens per run at batch
+4096, and every published number comes from a 2M-token held-out
+evaluation (`eval.py`) reproducible from the run's checkpoint. Everything
+below was measured on one NVIDIA A10 (24 GB), torch 2.7.0, headless over
+SSH; the code also runs on CPU (tests, `smoke_test.py`). Best model in
+the tree: TopK k=64 at 16x (12288 features), 1-FVU 0.885 and loss
+recovered 0.992 on held-out data; best under L0 <= 40: TopK k=32 at 16x,
+0.856 / 0.988 (see results).
 
-## running
+## results
+
+The 18-run frontier (`sweeps/frontier.json`, `results/frontier/`): ReLU +
+L1 at lambda in {2.5e-3, 5e-3, 1e-2} and TopK (+ AuxK at the paper
+defaults, aux_k = 2k, aux_coeff = 1/32) at k in {16, 32, 64}, each at
+expansion 4x / 8x / 16x (3072 / 6144 / 12288 features). Every run: 200M
+tokens (200,003,584) at batch 4096 (48,828 steps), lr 4e-4 after a
+1000-step warmup, AdamW betas (0.9, 0.99), seed 42, resampling every
+5000 steps, 1M-row buffer, `--forward hf`; evaluated on the same
+2,007,616 held-out tokens (fp32, position 0 excluded; CE clean 3.859,
+zero 13.813 on every row). 18 of 18 ok, 792.6 min total wall
+(`results/frontier/index.jsonl`).
+
+![L0 vs 1-FVU frontier](figures/frontier.png)
+
+![L0 vs loss recovered](figures/ce.png)
+
+Best per width at L0 <= 40 (`figures/tables.md`; the full 18-row table
+with CE, dead fractions, tok/s and wall time is in that file):
+
+| expansion | features | best 1-FVU run | 1-FVU | L0 | best loss_recovered run | loss_recovered | L0 |
+|---|---|---|---|---|---|---|---|
+| 4x | 3072 | topk_x4_k32 | 0.808 | 32.0 | topk_x4_k32 | 0.981 | 32.0 |
+| 8x | 6144 | topk_x8_k32 | 0.835 | 32.0 | topk_x8_k32 | 0.985 | 32.0 |
+| 16x | 12288 | topk_x16_k32 | 0.856 | 32.0 | topk_x16_k32 | 0.988 | 32.0 |
+
+Reading the frontier: TopK dominates ReLU + L1 at every width and
+sparsity - 0.04-0.08 of 1-FVU ahead at matched L0, and at half the L0 it
+matches L1 (`topk_x4_k16` 0.765 at L0 16 vs `relu_x4_l1-low` 0.764 at L0
+34.9). Width helps monotonically and by about the same step everywhere,
+~0.02-0.03 of 1-FVU per doubling at every k (k=32: 0.808 -> 0.835 ->
+0.856; k=64: 0.846 -> 0.868 -> 0.885), with no sign of saturation at
+16x. The lambda = 1e-2 column is the L1 collapse regime - L0 4.3-4.4
+with 37-44% of features dead at eval and 1-FVU 0.49-0.50 - so the L1
+curve effectively covers L0 4-37. Seed-to-seed noise on this recipe is
+under 0.001 of 1-FVU (`results/seeds/`: `topk_x4_k32` at seeds 42/1/2
+spans 0.0005, `relu_x4_l1-low` 0.0007), 30-100x smaller than every gap
+above; the one near-tie, `relu_x16_l1-low` 0.821 vs `topk_x16_k16`
+0.819, is ~3x the noise and should be read as "about equal". Without the
+L0 cap the k=64 rows win trivially; the best point without the cap is
+`topk_x16_k64`: 1-FVU 0.885, loss recovered 0.992 (CE 3.859 -> 3.934
+nats vs 13.813 zero-ablated) at L0 64.
+
+The default recipe (`python main.py` with no flags: ReLU 8x, lambda
+5e-3, 200M tokens) was run twice as a check - `results/a6_default`
+(derived schedule, warmup 976 / resample 6103) and `results/mvp` (the
+frontier's pinned 1000 / 5000, `sweeps/mvp.json`): 1-FVU 0.7249 vs
+0.7254, loss recovered 0.9533 vs 0.9539, L0 14.0 vs 14.1 - the two
+schedules agree to 0.0005 of 1-FVU and both reproduce the frontier's
+`relu_x8_l1-mid` cell (0.725 / 0.954 / L0 14.0). `results/SUMMARY.md`
+tabulates all of this, names the source file for every number, and
+records the anomalies (resample churn, transient AuxK engagement)
+measured from the per-run train logs.
+
+**Reproducibility contract.** Every `results/<run>/metrics.json` is
+regenerated from its checkpoint by
 
 ```
-pip install -r requirements.txt
-pytest -v
-python -m data tokenize --dataset monology/pile-uncopyrighted --n-tokens 220000000
---holdout-docs 20000 --out data/train.bin --holdout-out data/holdout.bin
-python bench_pipeline.py --shard data/train.bin --n-tokens 5000000 --min-tok-s 100000
-python main.py --train-shard data/train.bin --holdout-shard data/holdout.bin --run-name relu_x8   # 200M tokens, 8x
-python -m eval --checkpoint sae_gpt2_layer8.pt --holdout data/holdout.bin --n-tokens 2000000 --compare results/relu_x8/metrics.json
-python -m eval --checkpoint sae_gpt2_layer8.pt --holdout data/holdout.bin --n-tokens 200000 --identity
-python smoke_test.py                                          # CPU: tiny shards, main.py, eval --compare
-python sweep.py sweeps/smoke.json --results results/smoke     # two 200K-token runs, then:
-python sweep.py sweeps/frontier.json --results results/frontier  # the 18-run frontier (sweep)
-python plot.py --results results/ --out figures/              # frontier.png, ce.png, tables.md
+python -m eval --checkpoint results/<run>/checkpoint.pt --holdout data/holdout.bin --n-tokens 2000000
 ```
 
-`python -m data tokenize` streams the corpus once and writes packed uint16 shards (see pipeline). `bench_pipeline.py` is the throughput gate: it exits non-zero below `--min-tok-s` (300K on an A100, 100K on an A10) and prints GPU utilization; run it on the GPU host before any training run (its defaults are the training defaults below; `--activation topk --k 32` benches the TopK step). `main.py` trains one run with the frontier sweep frontier sweep's recipe as its defaults (default recipe): a 6144-feature SAE (`--expansion 8`) at layer 8 for `--n-tokens` 200M tokens from the shard, `--batch-tokens` 4096 (48,828 optimizer steps), AdamW `--lr` 4e-4 with `--adam-betas` 0.9 0.99, a `--buffer-tokens` 2M-row on-device shuffle buffer (6.1 GB), calibrating the input scale first (`--calibration-tokens`, default 100K); it saves the checkpoint (`--checkpoint`, default `sae_gpt2_layer8.pt`; sweep.py sets `results/<run>/checkpoint.pt`) BEFORE evaluating, runs the held-out evaluator (`eval.evaluate`, see evaluation) on `--eval-tokens` (default 2M) of the held-out shard in `--eval-batch-seqs` (default 64) rows per forward, and writes `results/<run>/` (`--run-name` defaults to a timestamp): `config.json` (the fully resolved configuration, written before the first step so a killed run still records what it was), `train_log.jsonl` (one JSON line per logged step - loss, MSE, L1, AuxK, L0, dead count, lr, tokens, elapsed - flushed as written, `tail -f`-able over SSH), `training_history.png` (the curves), and `metrics.json` (config, every metric, UTC timestamps, git SHA, torch version, GPU name, both shard sidecars, a training summary); it prints the `python -m eval --compare` command that regenerates those metrics from the checkpoint; then it prints analysis for the most interpretable features it finds (`--no-analysis` skips that; the analysis texts are the first 200 documents streamed from `--analysis-dataset`, default `monology/pile-uncopyrighted` - the shard corpus - filtered to 100 texts over 100 characters). The checkpoint carries (`eval.make_checkpoint`, `CHECKPOINT_KEYS`) the state_dict with its `input_scale` buffer, the config as a plain dict, `layer` / `hook_name`, `input_scale` / `activation` / `k` again as top-level scalars, `git_sha`, `torch_version`, `gpu_name`, `device`, `created_at`, the resolved run config (the content of `config.json`, so `eval_tokens` / `eval_batch_seqs` travel with the weights), the training history and the training shard's sidecar; it loads under `torch.load(weights_only=True)`. Knobs: `--n-tokens`, `--batch-seqs` (rows per GPT-2 forward, 256), `--batch-tokens`, `--buffer-tokens`, `--calibration-tokens`, `--eval-tokens`, `--eval-batch-seqs`, `--run-name`, `--results-dir`, `--seed` (42), `--device`, `--forward tl|hf` (default hf), `--analysis-dataset`; the dictionary and optimizer `--expansion` (n_features = expansion x 768, default 8), `--lr`, `--adam-betas`, `--l1-coeff` (default 5e-3, relu only), and the encoder variant `--activation relu|topk` (default relu; the numbers section's recommendation is `--activation topk --k 32`) with `--k` (default 32), `--aux-k`, `--aux-coeff` (AuxK, default off; see variants); the schedule `--warmup-steps`, `--resample-interval`, `--log-interval` (all in optimizer steps). **The schedule defaults are derived from the run length** (`main.default_schedule`, total steps = n_tokens // batch_tokens): warmup is 2% of the total steps (976 at the default recipe; the sweep files pin 1000), the resampling interval - which is also the dead-feature counting window - is total steps // 8, so resampling fires 8 times per run, at least 6 by design (6103 steps = 25.0M tokens at the default recipe; the sweep files pin 5000, 9 fires), and logging stays token-denominated at one row per 25.6K tokens (6 steps at batch 4096). Neither warmup nor the resample interval can outlive the run any more (bugs-fixed items 2 and 3); `train_sae` still warn-clamps a hand-set warmup that would. `SAEConfig`'s own defaults (`lr` 4e-4, `adam_betas` (0.9, 0.99), `warmup_steps` 976) and `training.BATCH_SIZE` (4096) / `train_sae(n_training_tokens=200M)` are the same recipe, so a config built outside `main.py` agrees with the CLI (`test_library_defaults_agree_with_the_cli`). Every flag can also come from `--config-json file.json` - a flat object keyed by flag name with underscores (`{"activation": "topk", "k": 32, "expansion": 8, "lr": 4e-4, "betas": [0.9, 0.99]}`; `name` and `betas` are aliases for `run_name` / `adam_betas`, keys starting with `_` are comments, unknown keys are an error) with explicit CLI flags taking precedence over the file - which is how `sweep.py` drives it. `python -m eval` runs the same evaluator on a saved checkpoint and reproduces `metrics.json` (`--compare`; `--identity` is the sanity mode, `--device cuda|cpu` overrides the auto choice; it replaces the old `variance_explained.py`, which is gone). `profile_sae.py` profiles one `training.train_step` under `torch.profiler` (CUDA only; `--activation topk --k 32 --expansion 8 --batch-tokens 4096` - the per-op view of the step that `bench_pipeline.py`'s tok/s does not give). `smoke_test.py` builds two tiny document-disjoint shards from in-memory text, runs `main.main` for 2000 tokens on CPU with real GPT-2 and then `python -m eval --compare` on the checkpoint it wrote - the reproducibility contract in miniature.
+which reprints every metric within 1e-4 (same shard, same device class);
+`--compare results/<run>/metrics.json` checks it in-process and exits 1
+on any mismatch, and `main.py` prints the exact command at the end of
+every run. What makes it hold: the checkpoint is saved *before* the
+evaluation, so it holds exactly the weights the record was computed
+from; `evaluate` is deterministic by construction (shard rows in order,
+no shuffling, fp32 with TF32 off, float64 accumulation), with
+`--n-tokens` / `--batch-seqs` defaulting to the values the checkpoint
+recorded; and the checkpoint carries its provenance (config,
+input_scale, git SHA, torch version, GPU name, train-shard sidecar).
+`python -m eval --identity` splices the raw activation back instead of
+the reconstruction and must give FVU 0 / loss recovered 1 - the check
+that the splice path is exact. The contract was exercised in a fresh
+process on the `a6_default` and `mvp` checkpoints (every metric
+reproduced within 1e-4; `results/README.md`) and runs end-to-end on CPU
+in `smoke_test.py` and `test_eval_cli_reproduces_main_metrics_json`.
+Checkpoints and shards are gitignored (`*.pt`, `data/`) and live on the
+training box; shard regeneration is deterministic - re-tokenizing from
+scratch reproduced the recorded sidecars exactly (`results/README.md`).
+Figures and tables are regenerated with
+`python plot.py --results results/frontier --out figures/` (recursive
+discovery; `--results results/` folds in every evaluated run,
+`--min-tokens` keeps short debug runs off the axes).
+
+## method
+
+**Dataset-wide input scale.** The SAE owns its input contract: raw
+residuals are multiplied by one scalar, `input_scale = sqrt(d_model) /
+mean ||x||`, calibrated once before training on the first >= 100K
+position-0-free tokens the loader yields (0.2282 on this corpus) and
+stored as a buffer in the state_dict, so the checkpoint carries its own
+contract and training, analysis and evaluation cannot diverge.
+`preprocess(x) = x * input_scale` is linear - no per-token operation, no
+clamping - so norm ratios between tokens survive and `postprocess`
+inverts it exactly: `forward` returns both `recon_scaled` (the space the
+loss lives in) and `recon_raw`, which splices straight back into the
+model's residual stream. After scaling, the mean token norm is
+sqrt(d_model), the scale the L1 coefficient is tuned against.
+
+**ReLU + L1 vs TopK (+ AuxK).** Selectable per run
+(`--activation relu|topk`, stored in the config, the checkpoint and
+`metrics.json`). ReLU (the code default): `h = relu((x_scaled - b_dec)
+W_enc + b_enc)`, `loss = MSE + l1_coefficient * sum_i |h_i|`; sparsity
+is indirect and the coefficient has to be re-tuned when the budget or lr
+changes. TopK: same pre-activations, per token only the k largest are
+kept (ReLU'd, so L0 <= k), everything else zeroed; the loss is MSE only
+(`SAEConfig` forces a non-zero l1_coefficient to 0 with a warning), so
+target sparsity is a config value and reconstructions are not shrunk by
+a penalty. Gradient flows only through the kept latents. AuxK
+(`--aux-k`, `--aux-coeff`; off by default, the sweep ran the paper's
+aux_k = 2k, aux_coeff = 1/32): per training step, reconstruct the
+detached residual `x_scaled - recon_scaled` from the top-aux_k
+pre-activations among currently dead features and add `aux_coeff *
+MSE` to the loss - a training-time regulariser whose gradient reaches
+only the dead features. `h` has the same shape and sign under both
+variants, so decode, evaluation, resampling and the analysis queries are
+variant-agnostic.
+
+**Resampling.** A feature is dead when it never fired in the current
+counting window (one `resample_interval`, derived as total steps // 8 so
+resampling fires 8 times whatever the budget; the counter is zeroed at
+every checkpoint, fired or not). Dead features are reinitialized toward
+high-error examples sampled proportionally to per-token reconstruction
+error from a rolling pool of the last 8 batches' activations and errors
+(a single batch yields near-duplicate directions from one data slice),
+and their AdamW moments are zeroed (`_zero_optim_state`) - stale
+momentum otherwise drags the new direction back toward zero on the first
+step. Measured across the recorded runs' train logs
+(`results/SUMMARY.md`): 19 of 22 resampled zero features at every
+checkpoint, and the lambda = 1e-2 runs' 37-44% eval-dead features were
+window-alive throughout - firing somewhere in each 20.5M-token counting
+window and never on 2M held-out tokens - so most dead-feature mass
+dodges the resampler rather than being caught by it.
+
+**Unit-norm decoder.** `W_dec` rows are constrained to unit norm by
+projecting the component of the gradient parallel to each row out before
+the optimizer step (Anthropic, *Towards Monosemanticity*), rather than
+renormalizing after it and fighting the optimizer; Adam's element-wise
+update still drifts slightly, so a renormalize runs every 100 steps as a
+safety net. Encoder and decoder are tied at init (`W_enc = W_dec.T`,
+random unit-norm rows).
+
+**Held-out protocol.** The FIRST 20,000 documents of the shuffled
+corpus stream go to the held-out shard, everything after to train, so
+the two are document-disjoint by construction; the sidecars record the
+ranges and `evaluate` raises rather than run on overlapping ranges (or
+on same-dataset shards whose split/seed differ, where disjointness
+cannot be certified). Position 0 - the BOS / attention-sink residual, a
+~26x norm outlier that is nearly constant across sequences - is excluded
+by *position* (mid-row EOS separators are ordinary tokens) from
+training, calibration and the eval set, and is left untouched by the
+splice and the ablation: the SAE never trained on it, and with it in the
+eval set FVU is a metric artifact. `eval.evaluate` walks the held-out
+shard in row order and runs the model three times per batch, in fp32
+with TF32 off: clean; with a forward hook at the hook point overwriting
+the residual at every non-BOS position with
+`sae.postprocess(sae.decode(sae.encode(x)))`; and with those positions
+zero-ablated. CE is the model's own next-token loss
+(`return_type="loss"`): logits at positions 0..126 predict the tokens at
+1..127, so BOS is never a target and every non-BOS target position
+counts.
+
+**Metrics.** `fvu` is computed in RAW residual space: the residual sum
+of squares over the sum of squares about the per-dimension mean, both
+over the eval tokens, with the mean accumulated Welford/Chan-style in
+float64; `variance_explained = 1 - fvu`. `loss_recovered = (ce_zero -
+ce_recon) / (ce_zero - ce_clean)`, CE in nats. `l0` is active features
+per token; `dead_frac_eval` is the fraction of features that never fire
+on the eval set. `mse_scaled` is the MSE in the space the loss lives in
+(`mse_raw` x `input_scale`^2). Loss and MSE are scaled-space numbers;
+FVU, L0 and CE are scale-invariant.
 
 ## pipeline
 
-Two stages, both in `data.py`, replacing the on-the-fly path (tokenize text and shuffle activations on the CPU per batch, ~15-23K tok/s, GPT-2-forward-bound on the CPU side).
+Two stages, both in `data.py`.
 
-**Shards.** `tokenize_corpus` streams an HF text dataset (`monology/pile-uncopyrighted` by default; `Skylion007/openwebtext` works with the same call), shuffles the document stream with `dataset.shuffle(seed, buffer_size=10_000)`, tokenizes with the plain HF GPT-2 tokenizer (no model load), and packs documents into contiguous rows of `seq_len=128`: BOS (id 50256) at position 0 of every row, then 127 tokens of a stream in which documents are separated by EOS (also 50256) - the same shape TransformerLens `to_tokens(prepend_bos=True)` gives, minus padding. Rows are written as a uint16 memmap `.bin` (all GPT-2 ids < 65536, two bytes per token; 220M tokens = 440 MB) with a `.json` sidecar carrying n_tokens, seq_len, seed, dataset, split, document range and tokenizer. The FIRST `holdout_docs` documents of the shuffled stream go to the held-out shard, everything after them to train, so the two are document-disjoint by construction and the sidecars record the ranges. `TokenShard` opens a shard; `python -m data info data/train.bin` prints its sidecar.
+**Shards.** `python -m data tokenize --dataset
+monology/pile-uncopyrighted --n-tokens 220000000 --holdout-docs 20000
+--out data/train.bin --holdout-out data/holdout.bin` streams the corpus
+once (document stream shuffled with seed 0, buffer 10K docs), tokenizes
+with the plain HF GPT-2 tokenizer, and packs rows of seq_len 128: BOS
+(50256) at position 0 of every row, then 127 tokens of a stream with EOS
+between documents - the shape TransformerLens `to_tokens(
+prepend_bos=True)` gives, minus padding. Rows are a uint16 memmap
+(440 MB for 220M tokens) with a JSON sidecar (token count, seed,
+dataset, document range, tokenizer); `python -m data info` prints it.
+Rebuilding the shards from scratch takes ~190 s on the GPU host and
+reproduces the recorded sidecars exactly.
 
-**Loader.** `ActivationLoader` takes `batch_seqs` rows at a time through `model.run_with_cache(tokens, names_filter=hook, stop_at_layer=layer+1)` - GPT-2 stops right after block 8, no layers above the hook are run - under `torch.no_grad()` and, on CUDA, bf16 autocast (activations are stored as float32; the SAE and its calibration therefore see bf16-forward activations, a ~0.5% perturbation that is far below the SAE's own error - the held-out evaluator runs fp32, see evaluation; `--no-autocast` in `bench_pipeline.py` measures the fp32 alternative). Position 0 is dropped by *position* (mid-row EOS separators are ordinary tokens and stay). Activations land in a `buffer_tokens`-row buffer on the training device (`buffer_tokens x 768 x 4` bytes; the default 2M rows is 6.1 GB, the frontier sweep ran with 1M); whenever fewer than half of its rows are unread it is refilled to full - the yielded rows are overwritten with fresh activations - and a fresh permutation over the whole buffer is drawn, so every activation is yielded exactly once and consecutive batches mix rows from many forward chunks. `train_sae` no longer has a buffer of its own: it just steps on the batches the loader yields, calibrating `input_scale` on the first >= 100K rows and then training on those same batches. Token transfers to the GPU are ~0.26 MB per 256-row chunk against a full GPT-2 forward on that chunk, so no pinned memory is used; `bench_pipeline.py` prints the measured shard-read + H2D share of loader time (profile mode times the two separately with a sync per forward) so that stays a measurement, not an assumption. Throughput is tracked in the loader (`tokens_yielded`, `throughput_tok_s()`, a log line every N batches).
+**Loader.** `ActivationLoader` runs batches of 256 rows through GPT-2
+under `torch.no_grad()` and (on CUDA) bf16 autocast, stopping right
+after block 8, through either backend (`--forward hf|tl`, default hf):
+`data.HFResidualModel` uses HuggingFace `GPT2Model` with SDPA attention
+and returns the residual after block 8 minus its per-token mean - which
+*is* TransformerLens' `blocks.8.hook_resid_post`, because TL's
+`from_pretrained` centres every matrix that writes into the residual
+stream and LayerNorm discards the mean anyway. That equivalence is a
+unit test (`TestHFResidualBackend`: residuals agree to 1e-4, and the
+loader yields identical batches on either backend), not an assumption;
+the TL forward measured ~1.6x slower on the A10, which is why hf is the
+default. Position 0 is dropped by position. Activations land in a
+`--buffer-tokens`-row shuffle buffer on the training device (default 2M
+rows = 6.1 GB; the sweep ran 1M): whenever fewer than half the rows are
+unread it refills every yielded slot with fresh activations and draws a
+new permutation over the whole buffer, so each activation is yielded
+exactly once and consecutive batches mix rows from many forward chunks.
+`train_sae` just steps on what the loader yields, calibrating
+`input_scale` on the first >= 100K rows and then training on those same
+batches. Note the buffer is filled before the first step and refills at
+half, so a run forwards ~buffer/2 more tokens than it trains on -
+harmless at 200M tokens, dominant for short runs (lower
+`--buffer-tokens`; `main.py` prints a note).
 
-**Gate.** `bench_pipeline.py --shard data/train.bin --n-tokens 5000000 --min-tok-s 300000` runs the loader alone and the loader + the real SAE step (`training.train_step`, the same function `train_sae` calls) over 5M tokens, prints both tok/s, the per-forward time and effective TFLOP/s of the GPT-2 forward, mean `torch.cuda.utilization()` during the loop (needs `nvidia-ml-py`) and peak memory, and exits 1 below the threshold. Do not start the MVP run until it passes with utilization > 80%.
+**Throughput, measured on the A10.** `bench_pipeline.py --shard
+data/train.bin --n-tokens 5000000 --min-tok-s 100000` is the gate: it
+reports steady-state tok/s for the loader alone and for loader + the
+real SAE step (`training.train_step`), prints the shard-read/H2D split,
+mean `torch.cuda.utilization()` and peak memory, and exits non-zero
+below the threshold (100K for an A10, 300K target for an A100 - not yet
+measured, no A100 run). Measured at the defaults: loader alone 141-143K
+tok/s steady state (the GPT-2 hf forward's own ceiling is ~144K = 227 ms
+per 32,768-token chunk, ~18 TFLOP/s effective), loader + SAE step 95K at
+8x and 111K at 4x - the gate passes at 4x and is missed at 8x by the
+dictionary size, not the data path (GPU utilization 100%, shard read +
+H2D a fraction of a percent of loader time; the pipeline is
+forward-bound). In full runs the same picture: the sweep recorded
+102.6K -> 88.0K -> 68.3K tok/s (ReLU) and 91.0K -> 73.9K -> 53.2K
+(TopK) at 4x / 8x / 16x (`figures/tables.md`) - at 16x the SAE step is
+the bottleneck - and the 200M-token default-recipe run trained in ~36
+min at ~93K tok/s end-to-end (`results/mvp/metrics.json`,
+`results/README.md`). `profile_sae.py`
+gives the per-op view of one step under `torch.profiler` (CUDA only);
+the held-out eval runs at ~9.7K tok/s (three full fp32 forwards per
+batch, ~3.5 min for 2M tokens).
 
-**Measured on the A10 (`--forward tl`): loader alone 82K tok/s, loader + SAE step 60-66K tok/s, GPU utilization 100%, peak 6.45 GiB, shard read + H2D 0.2% of loader time - so the gate (100K on an A10) is not met, and the data path is not why.** The 100% utilization with low throughput says the GPU is busy but inefficient: 170 forwards of 256x128 tokens took 60.6 s, i.e. ~356 ms per 32K-token forward through blocks 0-8, roughly 11 TFLOP/s effective against the A10's ~125 bf16 peak. That is the TransformerLens `HookedTransformer` forward itself (per-head einsum attention with the full (batch, head, pos, pos) pattern materialised in fp32, hook modules on every sub-step; TL is known to run 2-3x slower than the HF implementation) - the loader wrapping it is not the bottleneck. On top of that the SAE step costs (1/66K - 1/82K) ~ 3 us per token = 1.5-2.3 ms per 512-token step across runs, in line with `profile_sae.py`'s 2.6 ms, so even with a free forward the step caps at ~200-300K tok/s at batch 512. The follow-up bench runs pinned this down: with `--no-autocast` the forward is 397 ms instead of 356 ms (10.5 vs 11.7 TFLOP/s) - bf16 barely matters, so the TL forward is not matmul-bound at all, it is overhead- and memory-bound (per-head einsum attention with the fp32 (batch, head, pos, pos) pattern materialised, plus a hook module on every sub-step); and `--batch-tokens 2048` lifts loader + SAE only from 66K to 74K because the loader alone (82K) is the ceiling. Hence **the data-path rebuild: `--forward hf`**. `data.HFResidualModel` runs the loader's forward through HuggingFace `GPT2Model` (SDPA attention) and returns the residual after block 8 minus its per-token mean along d_model - which *is* TransformerLens' `blocks.8.hook_resid_post`, because TL's `from_pretrained` defaults (`center_writing_weights`) centre every matrix that writes into the residual stream, and LayerNorm discards that mean anyway so nothing downstream changes. That equivalence is a unit test, not an assumption: `TestHFResidualBackend` builds a TL model *from* a random-weight HF GPT-2 and checks the two residuals agree to 1e-4 (and disagree without the centring), checks the loader yields identical batches on either backend, and repeats the check against the real weights when they are available. `main.py` and `bench_pipeline.py` take `--forward tl|hf`; analysis (`build_activation_cache`, logit lens) and the held-out evaluator (`eval.py`, which needs the full model for the CE metrics) stay on TL either way. **Measured on the A10 with `--forward hf` (`test_real_gpt2_hf_backend_matches` green on the same box, so same activations): loader alone 128K tok/s (227 ms per forward, 18.3 TFLOP/s effective - 1.6x TL, not the 2-3x hoped for), loader + SAE step 90K tok/s at batch 512 and 106K at batch 2048 - the gate passes at 2048.** With the forward at 128K the SAE step is the ceiling again: 1/90K - 1/128K = 3.3 us per token = 1.7 ms per 512-token step, 1.6 us per token = 3.2 ms per 2048-token step. `--forward hf` is now the default. To make batch a free choice for the *pipeline*, warmup / resampling in `main.py` are derived from the step count of the run (2% of the steps / steps // 8; the default recipe - before that they were denominated in tokens, 51.2K / 128K = the 100 / 250 steps the 512-batch runs used) and logging is denominated in tokens (25.6K). What batch does NOT keep constant is the number of optimizer steps per token budget, and that ran both ways at 500K tokens with the hf forward: **at 512 (977 steps) FVU 0.632, L0 28.6, loss 0.5087 - the data path row reproduced to the third decimal (the same five top features, 1854 / 2256 / 1007 / 571 / 679), which is the end-to-end confirmation that the hf activations are the TL activations; at 2048 (244 steps, same `lr=2e-4`) FVU 0.823, L0 77.4** - badly undertrained: L1 pressure has not had time to bite. So `--batch-tokens` stayed at 512 for the 500K-token history rows (90K tok/s, 10% under the A10 gate); the frontier sweep sweep then ran at 4096 with lr re-tuned to 4e-4 (102.6K tok/s for ReLU 4x, gate met), and the default recipe made that the default. The honest reading of the gate: the pipeline can feed the SAE at 107K tok/s on an A10 at batch 2048 and 90K at 512; the forward is at 128K either way. Remaining levers on the forward: 18 TFLOP/s is still well below the A10's bf16 peak (autocast re-casts weights per op; `torch.compile` of the block loop and a bf16-weight copy of the model are the next two experiments, both cheap, neither done); on the step: a fused optimizer and `torch.compile` of `train_step`, which is where the last 10% at 512 would come from.
-
-**Tests.** The pipeline tests in `test_sae.py` run on CPU: tokenization against a fake in-memory dataset (packing, uint16, holdout disjointness via a monkeypatched `load_dataset`), shard round-trip, and the loader / a 5-step `train_sae` on a 64-row shard against both a hermetic random-weight `HookedTransformer` (runs anywhere) and the real GPT-2-small (skips, with a message, when the weights are not fetchable - offline dev boxes). The evaluator tests (`TestEvaluate`, `TestCheckHoldoutDisjoint`, `TestRunRecord`) follow the same split: a constructed exact-reconstruction SAE gives FVU 0 and loss recovered 1, the streaming FVU is checked against a two-pass reference, an all-zero SAE reproduces the zero-ablation exactly (which pins the position bookkeeping and that BOS is untouched), overlapping shard sidecars raise, the metrics.json schema round-trips - all on the tiny model - and zero-ablation-raises-CE / identity-splice-recovers-it runs on real GPT-2 over a 16-row text shard.
-
-## evaluation
-
-`eval.py` is the held-out evaluator: `evaluate(sae, model, holdout, hook_name, n_tokens, batch_seqs, device, exclude_bos=True, identity=False, train_meta=None)` walks the held-out shard in row order and runs the TransformerLens model three times per batch, in fp32: clean; with a forward hook at the hook point that overwrites the residual at every non-BOS position with `sae.postprocess(sae.decode(sae.encode(x)))`; and with those positions zero-ablated. It returns `fvu` (raw space: residual sum of squares over the sum of squares about the per-dimension mean, both over the eval tokens; the mean is accumulated Welford / Chan-style in float64, no `sum(x^2) - n mean^2` cancellation) and `variance_explained = 1 - fvu`, `mse_raw` (and `mse_scaled`, the same error x `input_scale`^2, the space the loss lives in), `l0`, `dead_frac_eval` (features never active over the eval set), `n_tokens`, `ce_clean` / `ce_recon` / `ce_zero` (mean next-token cross-entropy in nats over the model's own loss positions, `return_type="loss"`), and `loss_recovered = (ce_zero - ce_recon) / (ce_zero - ce_clean)`. Position 0 stays out of the eval set AND untouched by both the splice and the ablation: the SAE never trained on the BOS residual (see notes), so splicing a reconstruction of it would measure an out-of-distribution input, not the dictionary; `exclude_bos=False` splices and evaluates everything and is a diagnostic only. `identity=True` (`python -m eval --identity`) splices the raw activation back instead of the reconstruction and must give `loss_recovered == 1` (to 1e-3) and `fvu == 0` - the check that the splice path is exact. `evaluate` refuses (ValueError) to run when the held-out sidecar and the training sidecar (`train_meta`; `main.py` passes the training shard's, `python -m eval` reads it from the checkpoint or `--train-shard`) describe overlapping `doc_range`s of the same dataset / split / seed, and also when they share a dataset but not the seed or split (their ranges index different shuffles, so disjointness cannot be certified). CE is computed in fp32 with no autocast: bf16 logits at magnitude ~100 have a rounding step of ~0.5 nat, which would swamp `ce_zero - ce_recon`; TF32 matmuls are switched off for the duration of `evaluate` too (`eval.fp32_matmul`) - the training loader enables them process-wide for its own forward, and inheriting that would make `main.py`'s in-process numbers differ from a fresh `python -m eval` on Ampere. The training loader ran the forward under bf16 autocast, so the SAE trained on activations perturbed by ~0.5% relative to the fp32 ones it is evaluated on - far below its own error, and the same caveat the pipeline section already carries. Cost: three full 12-layer fp32 forwards per eval token; `--eval-batch-seqs 64` keeps the fp32 logits (b x 128 x 50257) at ~1.7 GB. `main.py` writes everything to `results/<run>/metrics.json` (`eval.make_run_record` / `write_json`; schema pinned by `test_metrics_json_schema`; it also carries `torch_version` and `gpu_name` next to `git_sha`).
-
-**Reproducibility contract (default recipe).** Every `metrics.json` is regenerated from its checkpoint by
+**Running it.** `pip install -r requirements.txt` (use
+`--break-system-packages` on the GPU host images), `pytest -v`, then:
 
 ```
-python -m eval --checkpoint results/<name>/checkpoint.pt --holdout data/holdout.bin --n-tokens 2000000
+python -m data tokenize --dataset monology/pile-uncopyrighted --n-tokens 220000000 \
+    --holdout-docs 20000 --out data/train.bin --holdout-out data/holdout.bin
+python bench_pipeline.py --shard data/train.bin --n-tokens 5000000 --min-tok-s 100000
+python main.py --activation topk --k 32                    # one 200M-token run, 8x
+python sweep.py sweeps/frontier.json --results results/frontier   # the 18-run frontier
+python plot.py --results results/frontier --out figures/
+python smoke_test.py                # CPU: the whole path incl. eval --compare, ~1-2 min
 ```
 
-which must print the same numbers as `results/<name>/metrics.json`'s `metrics` block, every metric within 1e-4 (same held-out shard, same device class; float noise between an in-process and a fresh-process evaluation is ~1e-6). `--compare results/<name>/metrics.json` checks it in-process (every `METRIC_KEYS` float within `--tol`, default 1e-4; ints, bools and the hook name equal; NaN equals NaN) and exits 1 on any mismatch; `main.py` prints the exact command at the end of every run. Three things make it hold: `main.py` saves the checkpoint before it evaluates, so the file holds exactly the weights the record was computed from; `evaluate` is deterministic by construction (rows in shard order, no shuffling, fp32 with TF32 off, float64 accumulation) and the eval set is the first whole batches that reach `n_tokens`, so `batch_seqs` is part of the contract - `python -m eval` therefore takes `--batch-seqs` and `--n-tokens` from the checkpoint's recorded `eval_batch_seqs` / `eval_tokens` when they are not given; and the checkpoint carries its provenance (git SHA, torch version, GPU name, creation time; `python -m eval` prints them next to the current ones, so a mismatch can be read against a torch or hardware change). `test_eval_cli_reproduces_main_metrics_json` runs the whole loop on the hermetic tiny model - `main.main`, then `python -m eval --compare` on what it wrote, then a tampered record that must fail - and `smoke_test.py` does the same on real GPT-2 on CPU. Measured on the A10 before the contract was formalised: `python -m eval` on the TopK comparison checkpoint reproduced `main.py`'s FVU 0.3778 / loss recovered 0.9242 to four decimals (numbers, the TopK comparison paragraph); every checkpoint written by the default recipe code carries what that comparison needed by hand.
+`main.py` with no flags trains the default recipe (ReLU 8x, lambda 5e-3,
+200M tokens, batch 4096, lr 4e-4, betas (0.9, 0.99), seed 42; pass
+`--activation topk --k 32` for the recommended encoder) and writes
+`results/<run>/{config.json, train_log.jsonl, training_history.png,
+metrics.json}` plus the checkpoint. Warmup, the resample interval and
+the log cadence are derived from the run length (2% of total steps /
+total steps // 8 / one row per 25.6K tokens) so none of them can outlive
+the run; `--warmup-steps` / `--resample-interval` / `--log-interval`
+override, and every flag can come from `--config-json file.json`, which
+is how `sweep.py` drives it (per-run subprocesses, skip-if-done,
+`index.jsonl`, `--parallel N` with one GPU per process). `train.log` and
+`train_log.jsonl` are `tail -f`-able over SSH; everything is headless.
 
-## variants
+## feature analysis
 
-Two encoder nonlinearities, selectable per run through `SAEConfig(activation=..., k=..., aux_k=..., aux_coeff=...)` and `main.py --activation relu|topk --k K --aux-k A --aux-coeff C`; the choice is stored in the SAE's config and therefore in the checkpoint (`asdict(config)`) and in `metrics.json`. **ReLU + L1** (the default, every row in the numbers table): `h = relu((x_scaled - b_dec) W_enc + b_enc)`, `loss = MSE + l1_coefficient * sum_i |h_i|`; sparsity is indirect - `l1_coefficient` trades reconstruction against L0 and has to be re-tuned whenever the input scale, the layer, or the token budget changes (see known issues), and L1 also shrinks the surviving activations. **TopK** (Gao et al. 2024, *Scaling and evaluating sparse autoencoders*): the same pre-activations, but per token only the `k` largest are kept (ReLU'd, so a negative value among the top k becomes 0 and L0 can be below k), everything else is zeroed; `loss = MSE` only, `l1_coefficient` must be 0 (`SAEConfig` forces a non-zero value to 0 with a warning). That sets L0 directly - `L0 <= k`, and `== k` on every token where at least k pre-activations are positive - so a target sparsity is a config value rather than the output of a coefficient sweep, the reconstruction is not shrunk by a penalty, and rows at different L0 are directly comparable. Gradient flows only through the kept latents (`apply_activation` scatters the top-k values into zeros; `pre_activations` exposes the pre-nonlinearity encoder output for both variants). `h` has the same shape and is non-negative under both, so `decode`, `eval.evaluate` (L0, dead fraction, FVU, CE), the resampling path (it keys off `feature_activation_counts`, which count `h > 0` either way) and the analysis queries (`find_interesting_features`, `find_max_activating_examples`, both tested on an exactly-k cache) are variant-agnostic. Dead features are the known failure mode of TopK - a feature that leaves the top k stops getting gradient and can never come back - and there are two remedies here: the existing resampling, unchanged, and **AuxK** (`aux_k > 0`, `aux_coeff`; default off, the paper uses `aux_k = 2k`, `aux_coeff = 1/32`): each training step, take the top-`aux_k` pre-activations among features that are currently dead (`feature_activation_counts == 0` in the current resampling window - which is every feature at step 0 and for one step after each resample), reconstruct the *detached* residual `x_scaled - recon_scaled` from those latents through `W_dec` (no `b_dec`: the main reconstruction already carries it), and add `aux_coeff * MSE(residual, aux_recon)` to the loss. The term is 0 when nothing is dead, is a training-time regulariser only (0 in eval mode), and its gradient reaches only the dead features' `W_enc` columns / `W_dec` rows, so it pulls them toward whatever the live dictionary misses without touching it. `SAEOutput.aux_loss` and `history["aux_loss"]` carry it unweighted; `main.py` plots it in the sixth panel when it is non-zero. **the TopK comparison measured (A10, `--activation topk --k 32 --aux-k 64 --aux-coeff 0.03125`, otherwise the 500K-token run recipe): FVU 0.378 and loss recovered 0.924 at L0 32.0 on the same 2M held-out tokens, against the 500K-token run's 0.628 / 0.789 at L0 28.4** - see the numbers table and the paragraph under it. In that run no feature was ever dead at a resample checkpoint (0 / 3072 at every one, 0 on the eval set), so resampling never fired and the AuxK term was non-zero only on the single step after each count reset - the row is effectively pure TopK, and AuxK is untested as a *remedy* until a run actually loses features (expect that at the MVP run scale, or with a larger dictionary). Note also that TopK's activations are not shrunk by an L1 penalty, so `mean-when-active` values in the analysis output are ~2x those of the ReLU rows; the ranking is comparable, the numbers are not.
+`analysis.py` builds an activation cache (model forwards, BOS stripped)
+and a feature cache (SAE encodes) over a text corpus and answers
+queries against them: `find_interesting_features` ranks features in the
+0.1%-20% activation-rate band by mean activation when active,
+`find_max_activating_examples` returns each feature's top contexts, and
+`feature_token_projection` is the logit lens (decoder row through the
+unembedding, deliberately omitting ln_final); `main.py` prints the top
+five features after training unless `--no-analysis`. The feature
+write-ups formerly in this section came from superseded small-budget
+checkpoints and are pending regeneration on the best frontier
+checkpoint (`topk_x16_k64`); until then this repo makes no claims about
+individual features.
 
-## sweep
+## what we found wrong along the way
 
-`sweep.py` runs a list of `main.py` configurations as subprocesses and `plot.py` turns their `metrics.json` files into the frontier figures and the tables the numbers section publishes; the 18-run frontier below has run once, end to end, on the A10 (18 of 18 ok, 13 h 12 min wall, `results/frontier/index.jsonl`; results under numbers, frontier sweep). `python sweep.py sweeps/frontier.json --results results/frontier` reads a JSON list of run entries (or an object with a `runs` list; other top-level keys and entry keys starting with `_` are comments, so the coefficient reasoning lives in the file next to the numbers), each with a unique `name` and any `main.py --config-json` keys (`activation`, `l1_coeff` or `k`, `expansion`, `n_tokens`, `lr`, `betas`, `batch_tokens`, `warmup_steps`, `resample_interval`, `seed`, `aux_k`, ...), and runs each as `python main.py --config-json results/<name>/sweep_entry.json` with `run_name` = name, `results_dir`, `checkpoint = results/<name>/checkpoint.pt` and `no_analysis` filled in, so every run leaves `results/<name>/{config.json, train_log.jsonl, checkpoint.pt, training_history.png, metrics.json}` plus `sweep_entry.json` (what was asked) and `train.log` (the subprocess's stdout + stderr), and appends one line per run to `results/index.jsonl` (name, status `ok` / `failed` / `skipped`, return code, wall minutes, timestamps, and L0 / FVU / loss recovered for an ok run). Runs whose `metrics.json` already exists are skipped unless `--force` - **the skip check looks under `--results`/<name>, so point `--results` at the sweep's own directory** (`results/frontier`, `results/seeds`, `results/smoke` - what the recorded runs used, per their sweep logs): `--results results/` would resolve every run to a fresh `results/<name>/`, skip nothing, and silently retrain the whole sweep (the console prints only when a run *finishes*; live output goes to `results/<name>/train.log`); a run that exits non-zero (or exits 0 without writing `metrics.json`) is recorded as failed with the tail of its log and the sweep continues, exiting 1 at the end if anything failed. `--shard` / `--holdout` set the shards for every run, `--set key=value` (repeatable, JSON-parsed) overrides any key for every run - `--set n_tokens=2000 --set buffer_tokens=4096` turns any sweep into a dry run - and `--dry-run` prints the commands. `--parallel N` runs N subprocesses at once; each is a full GPT-2 + SAE process, so that assumes one GPU per process (`--gpus 0,1` pins worker slots via `CUDA_VISIBLE_DEVICES`) - on a single-GPU box keep the default `--parallel 1`. Everything is headless; the sweep is meant to be started under `nohup` / `tmux` on the GPU host and watched through `index.jsonl` and `tail -f results/<name>/train_log.jsonl`.
+Bugs caught after full training runs, each with its mechanism. The
+regression tests named here are in `test_sae.py`.
 
-`sweeps/frontier.json` is the 18-run frontier: L1 with `l1_coeff` in {2.5e-3, 5e-3, 1e-2} and TopK with `k` in {16, 32, 64}, each at `expansion` in {4, 8, 16} (3072 / 6144 / 12288 features), all at 200M tokens, `batch_tokens` 4096 (48,828 optimizer steps), `lr` 4e-4 after a 1000-step warmup, AdamW betas (0.9, 0.99), seed 42, `resample_interval` 5000 steps (20.5M tokens; fires 9 times per run, at least 6 by design, and a wide enough counting window that only truly dead features are resampled - the token-denominated default of the time would have been 31 steps at this batch, a 127K-token window that would call every rare feature dead; the default recipe derives the default from the run length instead, total steps // 8 = 6103 at this recipe, and the sweep files keep pinning 5000 so the recorded runs stay reproducible from their entries). The three L1 values bracket L0 15-60 in the scaled space the loss lives in (mean token norm sqrt(768)): 5e-3 is the numbers-table recipe and pinned L0 at 28.6 at 500K tokens / lr 2e-4 (500K-token run); in this regime L0 moves roughly inversely with the coefficient (8e-4 gave 866 before input scaling, 5e-3 gives 17-43 across contracts) and a longer run lets the penalty bite a little harder, so mid = 5e-3 targets ~25, low = 2.5e-3 ~50-60, high = 1e-2 ~12-18. They are three literals in the file - edit them if the first rows land outside the bracket. **Measured (frontier sweep): they landed low - L0 35 / 13.5 / 4.3, nearly identical across widths, so the L1 curve covers L0 4-37, not 15-60, and the 1e-2 rows are the collapse regime (37-44% dead). The prediction under-weighted how much harder the penalty bites at 400x the tokens and 2x the lr, and L0 fell faster than 1/lambda (each doubling cut it ~2.6-3.1x). `sweeps/frontier_fill.json` (below) adds lambda 1.6e-3 and 3.5e-3 per width to reach the 20-60 range.** The TopK entries carry AuxK at the paper defaults (`aux_k = 2k`, `aux_coeff = 1/32`) because dead latents are the documented TopK failure mode at 8x / 16x and this many tokens (delete the two keys for pure TopK; the TopK comparison measured that with none dead the two are identical). `sweeps/smoke.json` is two 200K-token runs (relu 5e-3, topk k=32) with the same batch / lr / betas for a dry run of the whole path on the GPU host (48 optimizer steps: its FVU is above 1 and its L0 is not settled - it proves the path, not the recipe). `sweeps/frontier_fill.json` (6 runs, ~4 h) is the L1 fill-in: lambda 1.6e-3 and 3.5e-3 at each width, same recipe, run into the same `results/frontier/` so `plot.py` folds them into the frontier. `sweeps/seeds.json` (4 runs, 2 h 19 min measured) is the seed replicate: `topk_x4_k32` and `relu_x4_l1-low` at seeds 1 and 2, run into `results/seeds/` - it puts the seed variance the frontier's single seed cannot at under 0.001 of 1-FVU (numbers, the frontier sweep caveats).
+1. **The analysis pipeline fed the SAE mis-scaled inputs.** Input
+   scaling lived in the training loop only, so `analysis.py` encoded raw
+   layer-8 residuals with a model trained on scaled ones - rankings
+   survived (a monotone per-feature rescale), every absolute statistic
+   was wrong. Fix: the scaling moved inside the SAE (applied in
+   `encode`/`forward`/`resample_dead_features`), so training, analysis
+   and evaluation share one contract by construction
+   (`test_encode_applies_input_scale`). The first version of that fix
+   normalized every token to norm sqrt(d_model); it was replaced by the
+   single dataset-wide scalar described under method, because per-token
+   normalization destroys the per-token norm information the residual
+   stream carries and makes reconstructions unmappable to raw space.
+2. **An entire run happened inside LR warmup.** A fixed
+   `warmup_steps=1000` exceeded the run's total step count, so the run
+   ended before ever reaching the configured LR. Fix: warmup is derived
+   from the run length (2% of total steps), and `train_sae` warn-clamps
+   a hand-set warmup that would outlive the run.
+3. **Resampling never fired, and the dead-feature window was broken.**
+   A fixed `resample_interval` exceeded the total step count; and
+   `feature_activation_counts` was only zeroed when a resample actually
+   happened, so after any all-alive checkpoint the counting window grew
+   without bound ("dead" degraded to "never fired since step 0"). Fix:
+   the interval is derived (total steps // 8) and the counter is zeroed
+   at every checkpoint, giving true fixed-window semantics.
+4. **Resampling drew candidates from a single batch**, reinitializing
+   near-duplicate directions from one narrow data slice. Fix: the
+   rolling 8-batch pool of activations and per-token errors;
+   `SAEOutput.per_token_recon_error` exists so the loop never compares
+   the scaled-space reconstruction against raw inputs.
+5. **"Variance explained" wasn't FVU, and position 0 poisoned it.** The
+   original script compared flattened `.var()` ratios (deviation from
+   the global scalar mean), close to but not the FVU the literature
+   reports; and its eval set included position 0, whose near-constant
+   outlier residual carries ~90% of the sum of squares and is trivially
+   reconstructed, which made the headline look far better than it was.
+   The proper raw-space FVU (per-dimension mean, position 0 out) now
+   lives in `eval.evaluate` and the standalone script is gone.
+6. **Resampled features died again immediately**: AdamW's moments still
+   carried momentum from the feature's previous life and dragged the new
+   direction back toward zero on the first step. Fix: `_zero_optim_state`
+   (`test_resample_zeros_optimizer_state`).
+7. **Boundary off-by-one in the max-activating search**:
+   `searchsorted(right=False)` attributed a peak landing exactly on a
+   text boundary to the previous text (`test_peak_at_text_boundary`).
+8. **The pad-id trap.** GPT-2's pad id equals BOS/EOS, so a
+   `tokens != pad_id` filter also drops legitimate BOS positions -
+   position 0 must be excluded by position. Packed shards have no
+   padding at all (EOS between documents is an ordinary token), so the
+   loader's one slice is position 0, by position.
+9. **The original L1 pressure was meaningless.** With raw ~120-norm
+   inputs the L1 term was tiny relative to MSE and the first run came
+   out at L0 866; the input scale (method) decouples the coefficient
+   from the layer's activation scale.
+10. Smaller items: the checkpoint stores the config as a plain dict so
+    `torch.load(weights_only=True)` works; `W_enc` init was
+    `kaiming_uniform_` with fan-in inferred on the wrong axis - tied
+    init (`W_enc = W_dec.T`) sidesteps it; `find_interesting_features`
+    takes `n_features` and returns ranked indices instead of printing;
+    a redundant re-sort after `topk` removed; the `sae_no_l1` test
+    fixture runs in `.eval()` so it actually doesn't mutate activation
+    counts; `feature_token_projection` documents its deliberate
+    ln_final omission; a stale `trust_remote_code=True` kwarg removed
+    from `load_dataset` calls.
 
-`python plot.py --results results/ --out figures/` reads every `metrics.json` under `--results` at any depth - `results/<run>/` and nested sweep directories like `results/frontier/<run>/` or `results/seeds/<run>/` alike, so the documented command sees sweep output without pointing at each sweep directory (the MVP run fix: the old one-level glob silently dropped nested runs); point `--results` at one sweep directory to plot it alone - the checked-in `figures/` are the 18-run frontier, i.e. `--results results/frontier/` - or use `--min-tokens N` (e.g. 1000000) to keep short smoke/debug runs, whose 1-FVU can be negative, off an everything-view plot. Runs with `metrics: null` - no held-out shard - are listed and left off the plots. It writes `frontier.png` (x = held-out L0, y = 1 - FVU; color by expansion, marker by activation - relu circles, topk squares - every point labeled with its run name), `ce.png` (the same with y = loss recovered), and `tables.md`: one row per run with name, activation, k / lambda, features, n_tokens, L0, 1-FVU, loss_recovered, ce_clean / ce_recon / ce_zero, dead_frac_eval, tok/s (`training.loader_tok_s`, GPT-2 forward + SAE step) and wall_min (`training.train_wall_seconds`, training only - the sweep index has the whole subprocess), followed by a best-per-width table: for each expansion the run with the highest 1-FVU among runs at L0 <= 40 (`--max-l0`) and, separately, the run with the highest loss recovered under the same cap (without a cap the densest run wins both trivially). Nothing is recomputed - every number is read from the record `main.py` wrote.
+## known limitations
 
-**Tests.** `TestMainConfigJson` (precedence CLI > JSON > default, aliases, unknown-key / bad-choice errors, expansion / lr / betas / schedule overrides into `SAEConfig`), `TestMainInProcess` (`main.main` end to end on the hermetic tiny model with a config-json: the whole `results/<run>/` layout, the checkpoint round-trip, the metrics.json content), `TestSweep` (orchestration against a stub trainer in a real subprocess: index.jsonl, skip-if-exists and `--force`, a failure recorded and passed over with exit code 1, `--set` / `--shard` reaching the entry, `--parallel 2` with GPU pinning, `--dry-run`; and that both sweep files load and every entry key is a `main.py` key), `TestSweepEndToEnd` (the smoke sweep through the real `main.py` on CPU with real GPT-2 at 2K tokens on the test shard, then `plot.py` over the result - skips offline like every GPT-2 test), `TestPlot` (synthetic metrics.json files: the three outputs, the table rows, the best-per-width picks with and without a cap, an unevaluated run listed), plus `TestSAEConfigBetas` (betas reach AdamW) and `TestTrainLogJsonl` (one line per history row).
-
-## reporting conventions
-
-Every number in this file lives in one of two spaces, and the table below labels each row with its contract. Read nothing across rows without matching contract, position-0 policy, and L0.
-
-- **Loss and MSE are in scaled space**: `x * input_scale`, where `input_scale = sqrt(d_model) / mean ||x||` over the calibration sample. Under per-token normalization (the earlier contract) every token had norm sqrt(d); under the scalar contract only the *mean* does. MSE is not comparable across the two.
-- **FVU is in raw residual space** from `recon_raw` (residual sum of squares over sum of squares about the per-dimension mean). It is scale-invariant - numerator and denominator both pick up `input_scale`^2 - so it is the one number that survives a change of contract; it is *not* invariant to whether position 0 is in the eval set (see the notes section: with position 0 in, FVU is meaningless).
-- **L0** is active features per token, space-independent.
-- **CE clean / recon / zero and loss recovered** are from `eval.evaluate`: mean next-token loss in nats over the model's own loss positions on held-out rows, with the reconstruction (or zeros) spliced at every non-BOS position; `loss_recovered = (ce_zero - ce_recon) / (ce_zero - ce_clean)`. Measured for the 500K-token run and the TopK comparison rows (the evaluator landed with the 500K-token run).
-- **tok/s** is tokens through GPT-2 forward + SAE step per second of wall clock, on the stated GPU.
-
-## bugs fixed
-
-One critical inconsistency and several config-level bugs, caught after the first full training runs. Each fix is described with its mechanism, matching the pattern in the notes section below.
-
-1. **The analysis pipeline fed the SAE the exact input this README warned "will produce nonsense."** Training normalized activations to norm sqrt(d_model) inside the loop only, so `analysis.py` encoded raw layer-8 residuals with a model trained at ~27.7 - rankings survived (a monotone per-feature rescale) while every absolute statistic was wrong. Fix: the input scaling now lives inside the SAE (applied in `encode`/`forward`/`resample_dead_features`), so training, analysis, and evaluation share one contract by construction; `test_encode_applies_input_scale` pins it. The first version of that fix normalized every token to norm sqrt(d_model); it has since been replaced by a single dataset-wide scalar (`input_scale`, see the notes section) so reconstructions can be mapped back to raw space.
-2. **The entire run happened inside LR warmup.** 500K tokens / 512-token batches is ~976 steps, against `warmup_steps=1000` - the learning rate ramped toward 2e-4 and the run ended before reaching it, so every number in the pre-fix row below was produced at a fraction of the configured LR. Fix: `warmup_steps=100`, plus a clamp-with-warning in `train_sae` so this failure mode can't recur silently (the default recipe derives warmup as 2% of the run's steps, so it scales with the budget).
-3. **Resampling never fired, and the dead-feature window was broken.** `resample_interval=1000` > 976 total steps, so the resampling machinery was never exercised in the headline run; and `feature_activation_counts` was only zeroed when a resample actually happened, so after any all-alive checkpoint the counting window grew without bound ("dead" degraded to "never fired since step 0"). Fix: interval lowered to 250 and the counter is zeroed at every resample checkpoint, giving true fixed-window semantics (the default recipe derives the interval as total steps // 8, so it fires 8 times whatever the budget).
-4. **Resampling drew candidates from a single 512-token batch.** With many dead features that reinitializes near-duplicate directions from one narrow slice of data. Fix: a rolling pool of the last 8 batches' activations and per-token errors (~12 MB) feeds the sampler; `SAEOutput` now carries `per_token_recon_error` so the loop never compares the scaled-space reconstruction against raw inputs.
-5. **Variance explained wasn't FVU.** The old script compared flattened `.var()` ratios (deviation from the *global scalar* mean) - close to, but not, the FVU the literature reports. `variance_explained.py` then computed 1 - FVU properly (residual sum of squares over sum of squares about the per-dimension mean), in raw residual space from `recon_raw`; that computation now lives in `eval.evaluate` (see evaluation) and the script is gone. But see the position-0 note below: until the data path the script included position 0 in its eval set, which made its headline number look far better than it was; the corrected figure is in the table, and the evaluator uses the held-out shard with position 0 dropped.
-6. Smaller items: the checkpoint stores `asdict(config)` so `torch.load(..., weights_only=True)` works (pickling the frozen dataclass forced the unsafe flag on every consumer); `find_interesting_features` takes `n_features: int` instead of the whole SAE and returns ranked indices instead of printing (the per-feature rate / mean-when-active it used to print now come from `feature_activation_stats`, and `main.py` does the printing); a redundant re-sort after `topk` removed; the `sae_no_l1` fixture actually doesn't mutate now (`.eval()` - forward in train mode updates activation counts, so the old "doesn't mutate" comment was false); repeat data passes reshuffle document order; `feature_token_projection` documents its deliberate ln_final omission; the `trust_remote_code=True` kwarg is gone from both `load_dataset` calls (`datasets>=3` ignores it and printed a warning on every iterator restart).
-
-## numbers
-
-History rows (pre-frontier): all at 500K training tokens, 3072 features (4x), layer 8, on a Lambda A10 (24 GB); `l1_coefficient=5e-3` for the ReLU + L1 rows, MSE-only for the TopK row (see variants). One row per input contract / encoder variant; see reporting conventions.
-
-| run | input contract | position 0 | MSE | L0 | FVU (1 - FVU) | dead | wall / tok/s |
-|---|---|---|---|---|---|---|---|
-| pre-fix (items 1-5 above not yet applied) | per-token norm sqrt(d), applied in the training loop only | in train and eval | 0.45 (per-token space) | 43 | 55% VE by the pre-FVU metric (item 5) - not an FVU | 0 / 3072 (window broken, item 3) | ~32 s / ~15K |
-| per-token contract, items 1-6 applied (from the run notes; never recorded here before) | per-token norm sqrt(d), inside the SAE | in train and eval | - | ~27 | 1 - FVU 0.35 | - | ~15K |
-| **the first run: scalar contract** | `input_scale = 0.1896` calibrated on 102,132 tokens **including position 0** | in train, calibration and eval | 0.269 (scaled space) | 16.7 at end of training; 16.2 on the eval set | **0.683 excluding position 0** (0.933 VE = 0.067 FVU with it in - see notes; that figure is an artifact) | 0 / 3072 | 22 s / ~22.7K |
-| **the data path: scalar contract, position 0 excluded everywhere** (pile-uncopyrighted shard, seed 42) | `input_scale = 0.2281` calibrated on 102,400 shard tokens **excluding position 0** | out of train, calibration and eval | 0.357 (scaled space) | 28.6 at end of training; 27.5-27.9 on the held-out shard | **0.632 FVU = 0.368 VE** on 102,400 held-out tokens (document-disjoint, position 0 out) | 0 / 3072 | ~15 s (12 s of that is the 1M-row buffer fill for a 500K run) / 66K tok/s steady state with `--forward tl --batch-tokens 512` (loader alone 82K); |
-| **the data-path rebuild: same recipe, `--forward hf`** (HF SDPA forward, TL-equivalent) | `input_scale = 0.2282` on 100,352 shard tokens excl. position 0 | out of train, calibration and eval | 0.357 (scaled space) | 28.6 end of training; 27.9 held out | **0.632 FVU** on 102,400 held-out tokens - identical to the data path | 0 / 3072 | **90K tok/s** at batch 512 (loader alone 128K); 107K at batch 2048 (gate met) |
-| the data-path rebuild at `--batch-tokens 2048` (244 steps, same lr; NOT a recipe for 500K tokens) | 0.2282 | same | 0.466 | 77.4 | 0.823 FVU - undertrained | 0 / 3072 | 107K tok/s |
-| **the 500K-token run: the data-path rebuild recipe re-run, evaluated with `eval.evaluate` on 2,007,616 held-out tokens** (fp32 forwards) | 0.2282 | same | 0.355 scaled / 6.81 raw | 28.6 end of training; 28.4 held out | **0.628 FVU = 0.372 VE**; **CE clean / recon / zero 3.859 / 5.956 / 13.814 nats, loss recovered 0.789** | 0 / 3072 (none dead on the eval set either) | 52.9K tok/s end-to-end incl. buffer fill; eval 15.6K tok/s (3 fp32 forwards) |
-| **the TopK comparison: TopK k=32 (+ AuxK 64 / 1/32, never engaged - see variants), the 500K-token run recipe otherwise, same 2,007,616 held-out tokens** | 0.2282 | same | **0.214 scaled / 4.10 raw** | **32.0** end of training and held out (exactly k on every token) | **0.378 FVU = 0.622 VE**; **CE clean / recon / zero 3.859 / 4.614 / 13.813 nats, loss recovered 0.924** | 0 / 3072 (none dead on the eval set either) | 48.6K tok/s end-to-end incl. buffer fill; eval 15.6K tok/s |
-
-
-the TopK comparison vs the 500K-token run is the encoder change and nothing else (same shard, seed, batch, LR, warmup, resampling cadence, `input_scale` 0.2282 calibrated on the same 100,352 tokens): switching ReLU + L1 for TopK at k=32 takes FVU from 0.628 to 0.378 (raw-space MSE 6.81 -> 4.10, a 40% cut) and CE with the SAE spliced in from 5.956 to 4.614 nats - loss recovered 0.789 -> 0.924, i.e. 1.34 of the 2.10 nats the L1 SAE was losing are back. Two caveats before reading that as "TopK is 2.7x better". First, the rows are not L0-matched: 32.0 vs 28.4, and TopK's L0 is exact by construction while the L1 row's is a mean over a spread. Four extra latents per token cannot plausibly account for a 0.25 FVU gap (the L1 SAE went 16.7 -> 28.6 between the first run and the data path for 0.05 of FVU), but the clean comparison is a k=28 run, or a k=32 run against an L1 sweep that lands at 32; neither is done. Second, TopK's MSE at end of training (0.2128 scaled) equals its held-out MSE (0.2136), as it did for the 500K-token run (0.355 / 0.355): neither variant is memorising anything at 500K tokens, so the gap is representational, not a train/eval artifact. What TopK removes is the L1 shrinkage - the ReLU SAE has to trade every unit of activation against `l1_coefficient`, so its reconstructions are systematically too small - and the sparsity/reconstruction coupling: L1 sets L0 indirectly and the coefficient was tuned under a different input contract (known issues), whereas k=32 is simply the L0 asked for. Dead features: none at any of the three resample checkpoints and none on the eval set, same as the 500K-token run, so this run says nothing about AuxK. Throughput: 48.6K tok/s end to end (main.py, including the 1M-row buffer fill that dominates a 500K run) vs 52.9K for the 500K-token run - within run-to-run noise on the loader-fill-dominated number; `bench_pipeline.py` on the same box in the same session measured the ReLU step at 88.5K tok/s (vs 90K recorded earlier), and the TopK step - two extra kernels (`topk`, `scatter`) plus the masked top-k of the AuxK term - has not been benchmarked. Also on this run: `python -m eval` on the saved checkpoint reproduced main.py's in-process numbers to four decimals (FVU 0.3778, loss recovered 0.9242 both ways - checkpoint round-trip and evaluator determinism confirmed) but ran at 9.8K tok/s vs 15.6K in-process; same code path, same fp32 forwards, unexplained, noted for the next session.
-
-**the frontier sweep: the frontier sweep** (`sweeps/frontier.json`, `results/frontier/`, `figures/frontier.png` / `ce.png` / `tables.md`). 18 runs, one A10, 13 h 12 min wall, all ok on the first pass: ReLU + L1 at lambda in {2.5e-3, 5e-3, 1e-2} and TopK (+ AuxK 2k / 1/32) at k in {16, 32, 64}, each at 4x / 8x / 16x (3072 / 6144 / 12288 features), all at 200M tokens (200,003,584 actual), batch 4096 (48,828 steps), lr 4e-4 with a 1000-step warmup, AdamW betas (0.9, 0.99), seed 42, resampling every 5000 steps, `--forward hf`, evaluated with `eval.evaluate` on 2,007,616 held-out tokens (fp32 forwards, position 0 out; CE clean 3.859, zero 13.813 on every row). The full table is `figures/tables.md`; the shape of it:
-
-| | 4x, 3072 | 8x, 6144 | 16x, 12288 |
-|---|---|---|---|
-| L1 lambda 2.5e-3 | L0 34.9, 1-FVU 0.764, LR 0.969 | L0 36.2, 0.796, 0.975 | L0 36.9, 0.821, 0.981 |
-| L1 lambda 5e-3 | L0 13.3, 0.688, 0.942 | L0 14.0, 0.725, 0.954 | L0 14.7, 0.753, 0.964 |
-| L1 lambda 1e-2 | L0 4.3, 0.486, 0.853, 37% dead | L0 4.3, 0.495, 0.857, 43% dead | L0 4.4, 0.501, 0.861, 44% dead |
-| TopK k=16 | L0 16, 0.765, 0.971 | L0 16, 0.796, 0.978 | L0 16, 0.819, 0.982, 1.4% dead |
-| TopK k=32 | L0 32, **0.808, 0.981** | L0 32, **0.835, 0.985** | L0 32, **0.856, 0.988** |
-| TopK k=64 | L0 64, 0.846, 0.988 | L0 64, 0.868, 0.990 | L0 64, **0.885, 0.992** |
-
-(1-FVU raw space; LR = loss recovered; dead = `dead_frac_eval` on the 2M held-out tokens, 0 where not shown.) Three readings. **TopK dominates L1 at every width and sparsity**, and not narrowly: at 4x, k=16 (L0 16) reconstructs as well as L1 at L0 35 (0.765 vs 0.764) and recovers as much loss (0.971 vs 0.969); k=32 is 0.808 / 0.981 where the best L1 row at any L0 is 0.764 / 0.969. This is the L0-matched comparison the TopK comparison asked for, in both directions - TopK at half the L0 matches L1, TopK at the same L0 (16 vs 13-14, 32 vs 35) is 0.05-0.08 of 1-FVU ahead - so the TopK comparison gap was representational, as the TopK comparison argued, not the four extra latents. **Width helps monotonically and by about the same step at every k**: k=32 goes 0.808 -> 0.835 -> 0.856 and loss recovered 0.981 -> 0.985 -> 0.988 across 4x / 8x / 16x, k=64 0.846 -> 0.868 -> 0.885, with no sign of saturating at 16x; the L1 rows gain the same ~0.03 per doubling. `plot.py`'s best-per-width table (L0 <= 40) picks `topk_*_k32` for both metrics at all three widths - correct, and slightly boring, because k=32 is the only run just under the cap; the best point without the cap is `topk_x16_k64`, 1-FVU 0.885 / loss recovered 0.992 / CE 3.934 vs 3.859 clean, 0.075 nats. **The L1 bracket landed low** (see sweep): L0 35 / 13.5 / 4.3 instead of the predicted ~55 / 25 / 15, so the L1 frontier covers L0 4-37 and the lambda=1e-2 column is the collapse regime - L0 4, 37-44% dead features at eval, 1-FVU 0.49 - which is where L1 falls off a cliff and worth keeping in the plot for that reason, at the cost of 3 of the 9 relu runs; `sweeps/frontier_fill.json` adds two lambda per width to reach 20-60. Dead features otherwise: zero at eval for every TopK run except `topk_x16_k16` (1.4%); whether that is AuxK working or TopK not needing it at this scale, this sweep cannot say (the aux-loss column of `train_log.jsonl` says whether the term ever left zero; the pure-TopK ablation the TopK comparison asked for is still not run). On the L1 side `relu_x16_l1-mid` at 6.8% dead, rising with width at fixed lambda (0.2% -> 1.0% -> 6.8%), is the thing to watch if anyone trains L1 wider. Throughput, as a by-product: ReLU 4x 102.6K tok/s at batch 4096 (the A10 gate met, again, at the sweep batch), TopK ~11% dearer (91K), and 16x TopK 53K - at 16x the SAE step, not the GPT-2 forward, is the bottleneck; wall_min in the table is training only, the index has 30-63 min per run including the buffer fill and 2M-token eval. Caveats: the frontier is one seed (42) per cell; `sweeps/seeds.json` (`results/seeds/`, 4 runs, 2 h 19 min) re-ran the two 4x recipes at seeds 1 and 2 and the spread is tiny - `topk_x4_k32` 1-FVU 0.8077 / 0.8076 / 0.8072 (range 0.0005), loss recovered 0.9809 / 0.9810 / 0.9810 (0.0001), L0 32.0 on all; `relu_x4_l1-low` 1-FVU 0.7643 / 0.7638 / 0.7645 (0.0007), loss recovered 0.9686 / 0.9685 / 0.9679 (0.0007), L0 34.88 / 34.85 / 34.99 (0.14) - so seed-to-seed noise on this recipe is under 0.001 of 1-FVU and every gap the paragraphs above lean on (0.03 per width doubling, 0.05-0.08 TopK over L1 at matched L0) is 30-100x that; the one near-tie, `relu_x16_l1-low` 0.821 vs `topk_x16_k16` 0.819, is ~3x the measured noise and should be read as "about equal", which is the L1-at-2x-the-L0-matches-TopK point in the other direction. The replicate is at 4x only, and seeds vary the initialization and shuffle but not the data (same shard, same order of documents in the stream) - a wider dictionary or a different corpus could be noisier. Every row is the same hook, the same held-out shard and the same evaluator, so the comparison is clean but not cross-checked against a second data source; and the TopK rows carry AuxK while the TopK comparison was the same config, so the TopK comparison -> the frontier sweep change at k=32 / 4x (0.622 -> 0.808) is 400x the tokens, 8x the batch, 2x the lr and the betas, not the encoder.
-
-**the default recipe: the default recipe, run once as a check.** `python main.py --train-shard data/train.bin --holdout-shard data/holdout.bin --run-name a6_default` with no other flags (ReLU 8x = 6144 features, lambda 5e-3, 200M tokens, batch 4096, lr 4e-4, betas (0.9, 0.99), 2M-row buffer, warmup 976 / resample every 6103 steps - both derived, not pinned - `--forward hf`, seed 42) on the A10: 200,003,584 tokens in 35 min 32 s at 93.8K tok/s end-to-end (200 buffer refills), final loss 0.2701, L0 14.0, 134 / 6144 dead at the end of training, `input_scale` 0.22823. Held out (2,007,616 tokens): **1-FVU 0.7249, loss recovered 0.9533** (CE 3.859 / 4.324 / 13.813), L0 14.0, 81 dead (1.3%). That is the `relu_x8_l1-mid` cell of the frontier table (0.725 / 0.954 / L0 14.0) reproduced independently with a 2M-row buffer instead of 1M and the derived schedule instead of the pinned 1000 / 5000 - the defaults are the sweep. Then the contract: `python -m eval --checkpoint sae_gpt2_layer8.pt --holdout data/holdout.bin --n-tokens 2000000 --compare results/a6_default/metrics.json` in a fresh process printed the same FVU 0.2751 / L0 14.0 / 81 dead / CE 3.8590 / 4.3235 / 13.8133 / loss recovered 0.9533 and ended `reproduces results/a6_default/metrics.json: OK (every metric within 0.0001)`, exit 0, with `--batch-seqs` taken from the checkpoint; `--identity` on 200K tokens gave FVU 0.0000 / loss recovered 1.0000 / `identity check: OK`. `python -m eval` ran at 9.65K tok/s against ~15.6K in-process, the same unexplained gap the TopK comparison noted. The checkpoint recorded torch 2.7.0 / NVIDIA A10 and `git_sha` None - the GPU host's working copy is not a git checkout, so that field is only informative when it is. Throughput at the defaults on the same box: `main.py`'s own end-to-end figure over the 200M-token run is the authority, **93.8K tok/s** (200 buffer refills; the forward is 227 ms per 32,768 tokens = 144K tok/s of forward capacity, 18.3 TFLOP/s - the data-path rebuild forward, unchanged), and `profile_sae.py` (TF32, as in training) puts the TopK 8x step at 14.0 ms = 3.4 us/token, which predicts 1 / (1/144K + 3.4us) = 96K - the three agree. That is ~5% under the 100K A10 gate, which was calibrated when the default dictionary was 4x (the sweep: 102.6K ReLU 4x, 91K TopK 4x); the matmuls are twice as large at 8x, so the gate is missed by the dictionary size, not by the pipeline. In the profile the three tensor-op sgemms are 5.5 ms of the 14, AdamW 1.4 ms, `topk` + its radix kernel 1.3 ms - the fixed TopK cost that made TopK 11% dearer at 4x is 2% at 8x - and "Command Buffer Full" (42%) is the profiler's own launch-queue stall, not a training cost; with TF32 off (`--no-tf32`, how the script ran before the default recipe) the same step is 24.4 ms on `ampere_sgemm` SIMT kernels, which is not the step that trains because `ActivationLoader` enables TF32 process-wide before `main.py`'s first step. `bench_pipeline.py --n-tokens 5000000` needed two rounds of correction to agree with those numbers, and both are worth knowing about when reading old bench figures: its raw yielded-tokens / wall-clock over a 5M-token window is not steady state with a 2M-row buffer, because the loader forwards 2M rows before its first yield (fill) and then yields the top half of the buffer without forwarding anything (borrow) - with the fill in the window "loader alone" read 118K (under), with it out 179K (over - above the forward's own 144K ceiling, which is what gave it away), and pass 2 read 94.5K / 95.1K either way only because its own borrow happened to cancel; the "SAE step = 1/pass2 - 1/pass1" line it printed for one revision (20 ms) inherited pass 1's inflation. The bench now reports steady state: the loader's rate F is yieldable rows *forwarded* per second of the window (yield == forward in the long run), the SAE step is the pass-2 window's time minus its forwards at F, per row, and the gated number is 1 / (1/F + s); the raw window figures are still printed next to them. The 1M-buffer-era bench numbers (128K loader alone, 90K / 107K end-to-end) carried the same fill-in-window under-count, ~17% on the loader-alone line, so the true forward rate then was the same 144K it is now. Re-run with the steady-state accounting on the same box: loader alone 143.0K tok/s (99.9% of the forward's 144.2K ceiling; raw window 178.8K over 5,001,216 yielded / 3,998,976 forwarded, i.e. the borrowed ~1M rows, printed beside it), loader + SAE step **95.2K at 8x** (raw 95.1K - pass 2's borrow cancels at this window size, which is why the earlier bench revisions were accidentally right on the gated number), SAE step 3.51 us/token = 14.4 ms per 4096-token step against the profiler's 14.0 ms for TopK, and 200M x 3.51 us + 202M / 144.1K = 2,104 s predicted for the training run against 2,132 s measured. `--n-features 3072`, the like-for-like check against the sweep: **111.7K, gate met**, SAE step 1.94 us/token = 8.0 ms - so 4x -> 8x costs 6.4 ms per step, 0.8x the 4x step for 2x the matmul, i.e. the 4x step is about half launch overhead and half matmul and the 8x step is mostly matmul; and the sweep's 102.6K for ReLU 4x carried the fill-in-window under-count (~9% at 5M tokens on a 1M buffer), the true 4x steady state was ~112K then too. So the gate is met at 4x and missed at 8x by the dictionary, correctly, on a pipeline that has been at 143-144K forward-bound since the data-path rebuild.
-
-the frontier sweep rows supersede the 500K-token rows above as the recipe: 200M tokens, batch 4096, lr 4e-4, betas (0.9, 0.99), TopK k=32 (or 64) at the widest dictionary the GPU host affords - and the default recipe made those the defaults (`main.py` with no flags is 200M tokens, batch 4096, 8x, lr 4e-4, betas (0.9, 0.99), 2M-row buffer, 2M eval tokens; the encoder default stays `relu`, pass `--activation topk --k 32`). The 500K rows stay as the controlled ablation history (the first run -> the TopK comparison change one thing at a time; the frontier sweep changes several at once and is a frontier, not an ablation). the default recipe paragraph above is that default recipe run once, reproducing the frontier's `relu_x8_l1-mid` cell and its own `metrics.json` from the checkpoint.
-
-the 500K-token run is the same recipe as the data-path rebuild (identical loss 0.5087 / L0 28.6 / top-five features 1854 / 2256 / 1007 / 571 / 679 at the end of training) with the held-out numbers now coming from the full evaluator over 2M tokens instead of 102K: FVU 0.628 vs 0.632 (sampling noise on the eval set, and fp32 rather than bf16 forwards). The new columns are what the field compares on: with the SAE spliced in the model's loss rises from 3.86 to 5.96 nats against 13.81 for zero-ablation, i.e. 79% of the loss is recovered at L0 28 - the expected picture for a vanilla L1 SAE at 500K tokens (2.1 nats of loss lost is a lot; a top-k / JumpReLU encoder and more tokens are the levers, see known issues). The identity splice on the same shard gives loss recovered 1.0000 and FVU 0 (`python -m eval --identity`, 200K tokens), so the 0.789 is the dictionary, not the plumbing.
-
-the data path vs First run: `input_scale` came out at 0.2281 - the sqrt(d)/121 = 0.228 the first run caveat below predicted once position 0 left the calibration mean - and with the L1 pressure restored L0 moved from 16.7 to 28.6, back inside the 27-43 band the per-token contract had. FVU 0.632 on the held-out shard is directly comparable to the first run's corrected 0.683 (both position-0-free); the eval set is now document-disjoint from training by construction and the training corpus is pile-uncopyrighted rather than pile-10k, so it is not a controlled comparison beyond that. Note the wall column: the 1M-row buffer is filled before the first step, so a 500K-token run spends most of its time on activations it never trains on (see pipeline); steady-state throughput is what `bench_pipeline.py` reports.
-
-Caveats on the first-run row, all addressed by the data-path rebuild: the eval set for the FVU/L0 columns was the first 80 documents of `NeelNanda/pile-10k` (9,882 tokens), which the training stream also walked, so it is not held out - the data path evaluates on a document-disjoint held-out shard; and the calibration mean of 146 was inflated by position 0 (ordinary tokens average 121), so `input_scale` is ~20% smaller than the sqrt(d)/121 = 0.228 it should be, which loosened the effective L1 pressure and is part of why L0 came out at 16.7 rather than nearer 20 - the data path calibrates on position-0-free rows. Do not quote the 0.067.
-
-The pre-fix and per-token rows are kept for history and cannot be compared to the scalar rows: different space for MSE, different L0, and (for the pre-fix row) a different metric entirely.
-
-## features
-
-Five features from the first run checkpoint (top of the 0.1%-20% activation-rate band, ranked by mean activation when active). All five are legible from their top contexts and logit-lens projections; none is a confirmed result in the sense of having been checked against a second seed or a held-out corpus.
-
-- **feature 1869** - Romance-language subword text. Fires on Spanish / Portuguese word pieces (` que`, `unta`, `ente`, `ando`, `ado`); the decoder row promotes ` é`, ` la`, `ó`, `és`, `à`.
-- **feature 1854** - newline inside source code (after `;`, before `///` doc-comments, around `@end`); promotes runs of spaces and `posted` / `Posted`.
-- **feature 2844** - runs of indentation whitespace in XML- / JSON-like text; promotes ` `, ` ]`, ` )`, ` |` and underscore rules.
-- **feature 2219** - the curly-apostrophe UTF-8 artifact: fires on the mangled byte in `don�t`, `it�s`, `wasn�t` and promotes replacement-character byte tokens. **This is the pre-fix README's feature 2256** (below), rediscovered at a new index after retraining under a different input contract from a different random init - a small but real stability signal.
-- **feature 2731** - first-person subject, predict the verb: fires on ` I` / `I` / ` i` and promotes `'ve`, ` think`, ` know`, ` believe`, ` want`, ` understand`.
-
-The ranking key is mean-when-active, which is why token-identity features (whitespace, byte fragments) sit at the top; that is a knob in `find_interesting_features`, not a finding.
-
-the data path checkpoint's top five by the same ranking: **1854** (code newline, same index as the first run), **2256** (the curly-apostrophe UTF-8 artifact - the *pre-fix* index, which the first run had found at 2219), **1007** (newline before a section heading / article start: promotes *Introduction*, *References*, *Advertisement*), **571** (Romance-language subwords, the first run's 1869), and **679** (sentence-boundary / discourse-connective, the pre-fix index). Same feature families across three runs, indices moving between them - a caveat on the "stability signal" above: `main.py` seeds `torch.manual_seed(42)` before building the SAE and that seed has not changed between runs, so the first run and the data path (and very likely the pre-fix run) started from the *same* random `W_dec`; index reappearance is partly the shared init, not only the data. A second-seed run is the cheap way to separate the two.
-
-the TopK comparison (TopK, k=32) checkpoint's top five by the same ranking - mean-when-active roughly doubles across the board without L1 shrinkage, so the values are not comparable to the rows above, only the ordering is: **17** (the indefinite article: fires on `An` / ` an` at 10-11 and promotes vowel-initial word pieces - `abolic`, `agram`, `amorph`, `oint`), **720** (newline inside source code / Markdown fences: the first run's 1854 family, promoting runs of spaces and `posted` again), **2256** (the curly-apostrophe UTF-8 artifact - **the same index for the third time**, pre-fix, the data path and now the TopK comparison, across two input contracts and two encoder nonlinearities), **2142** (newline at the boundary between non-English prose and code - Norwegian / Portuguese / Spanish sentences followed by `Model.php:`, `var counter`), and **1206** (`A` at line start, strongest on the `A:` answer marker of Q&A-formatted text - the pre-fix 2107 Q&A family, seen from the answer side; promotes ` lot`, ` few`, ` handful`, ` couple`). Further down the top 50, **679**, **1007** and **1869** reappear at their earlier indices too. That settles the "stability signal" question raised above in favour of the shared init: `main.py` still seeds `torch.manual_seed(42)` before `SparseAutoencoder(config)`, so every run starts from the same `W_dec` / tied `W_enc`, and a feature landing at 2256 under a *different nonlinearity* is the init deciding which random direction gets pulled onto the apostrophe artifact, not the data. Which features exist is a data result; which index they sit at is not. A second-seed run remains the cheap way to make that explicit.
-
-For history, the three features written up from the **pre-fix** checkpoint - identified under the mis-scaled analysis path (bug 1) and never re-verified: **679**, a sentence-boundary / discourse-connective detector (fires on `.` + newline; promotes *However*, *Furthermore*, *Moreover*); **2107**, a Q&A-format detector (fires on the newline after `Q:`; promotes *What*, *How*, *Why*); and **2256**, the UTF-8 encoding-artifact detector that reappeared as 2219 above.
-
-## notes
-
-**Position 0 is a 3141-norm outlier and must be excluded by position, not by id.** At layer 8, the residual at position 0 (the BOS / attention-sink position) has mean norm 3141; every other position averages 121 - a 26x gap - and the position-0 vector is nearly constant across sequences. Three consequences, all found in the first run run. (a) In raw space it carries roughly 90% of the sum of squares about the per-dimension mean, and the SAE reconstructs it almost perfectly (near-constant vector = `b_dec` plus one feature), so FVU over all positions came out at 0.067 while FVU on the same checkpoint with position 0 removed was 0.683 - the first number is a metric artifact. (b) It inflated the calibration mean (146 vs 121), so `input_scale` was ~20% too small and the L1 pressure correspondingly loose. (c) In scaled space it has norm ~600 against ~23 for ordinary tokens, so a non-trivial share of the loss, the gradient, and the dictionary went to reconstructing a constant. The exclusion must be by *position*: packed sequences also carry id 50256 as EOS between documents, and those mid-sequence tokens are ordinary (a `tokens != pad_id` filter is exactly the mistake described further down). The analysis cache has stripped position 0 since the first analysis pass (see the last note in this section); as of the first run the training buffer, calibration sample and eval set did not. the data path's loader drops it by position for training, calibration and the held-out FVU (`exclude_bos=True`, the default), and it passes through untouched when splicing. This also corrects a number this README repeated for a long time: "layer 8 residuals have norm ~150" was the mean *with* position 0; ordinary tokens are ~120.
-
-`find_max_activating_examples` uses `searchsorted` to map a flat token index back to (text, position). Default `right=False` is off-by-one when a peak lands exactly on a text boundary - text k's first token gets attributed to text k-1. Caught by spot-checking analysis output. Regression in `test_peak_at_text_boundary`.
-
-Dead-feature resampling kept producing features that died again on the next step. AdamW's first and second moments still carried momentum from when the feature had been alive (and then went dead), and that momentum dragged the reinitialized direction back toward zero on the very first step. Fix is `_zero_optim_state`; covered by `test_resample_zeros_optimizer_state`.
-
-The decoder is constrained to unit-norm rows. Naive approach: renormalize after each optimizer step. That fights the optimizer - every step nudges rows off the unit sphere and we yank them back. Cleaner: project the component of `grad(W_dec)` parallel to each row out before stepping, so the optimizer never moves rows off the sphere in the first place (Anthropic, *Towards Monosemanticity*). Adam's element-wise update can still produce small drift, so I kept a renormalize call every 100 steps as a safety net. `project_decoder_grad` and `test_grad_perpendicular_after_projection`.
-
-The encoder/decoder are tied at init: `W_dec` is random unit-norm rows, `W_enc = W_dec.T`. The earlier version used `kaiming_uniform_` on `W_enc`, which infers `fan_in` from `tensor.size(1)` - but here the actual fan-in is `size(0)`, so the init scale was wrong on the wrong axis. Tied init sidesteps the issue and is what the SAE reference implementations do anyway.
-
-Earlier version of the training loop filled an 8-chunk buffer (~30K tokens), sampled 512 tokens per step, and discarded the rest. About 1.5% utilization. Replaced with a 64K-token shuffled buffer walked through batch-by-batch, refilled when a batch wouldn't fit. ~100% now, but walked fully then refilled, so consecutive batches came from one shuffled corpus window. the data path moved the buffer onto the GPU (`data.ActivationLoader`, 2M rows by default since the default recipe, 1M before) and refills at half with a fresh permutation over the whole buffer, so batches mix rows from many forward chunks and each activation is still yielded exactly once.
-
-GPT-2's pad token id equals BOS/EOS, so a `tokens != pad_id` filter would also drop legitimate BOS positions. The old on-the-fly source tokenized with HF's tokenizer (real attention mask), prepended BOS, then used the mask to drop pad-position activations. the data path's shards are packed - every row is full, no padding, EOS between documents - so there is no mask at all; the one slice the loader takes is position 0, by position.
-
-First training run came out with L0=866 - the SAE was using a quarter of its 3072 features on every token. Ordinary layer-8 residuals have norm ~120 (~150 if you average position 0 in), so the L1 penalty `l1_coefficient * sum(|h_i|)` was tiny relative to MSE and sparsity wasn't being optimized. Fix: scale the inputs so the L1 coefficient is decoupled from the layer's activation scale. The SAE now carries one dataset-wide scale factor, `input_scale = sqrt(d_model) / mean ||x||`, computed once from a calibration sample (`set_input_scale_from_activations`; `train_sae` does this on its first buffer fill, >= 100K tokens by default) and stored as a buffer in the checkpoint. `preprocess(x) = x * input_scale` is linear - no per-token normalization, no clamping - so norm ratios between tokens survive, and `postprocess` divides the scale back out: `forward` returns both `recon_scaled` (the space the loss lives in) and `recon_raw`, which can be spliced straight back into the model's residual stream. An earlier version normalized *each token* to norm sqrt(d_model); that equalised per-token norms, which is information the residual stream carries, and made reconstructions unmappable to raw space. After scaling and bumping `l1_coefficient` from 8e-4 to 5e-3, L0 settled at ~43 under the per-token contract and ~17 under the scalar one (see known issues). The scaling originally lived in the training loop only - which is how the analysis-path bug (item 1 above) happened; it now lives inside the SAE, where the checkpoint's input contract belongs. A checkpoint written before `input_scale` existed loads with a warning and `input_scale = 1.0`.
-
-The first analysis pass had every "interesting" feature firing on `<|endoftext|>` because BOS has an outlier activation that monopolises every per-feature top-k. Stripping it from the analysis corpus (one slice in `build_activation_cache`) was enough to surface the features above. That was the same 3141-norm position-0 outlier described at the top of this section, seen from the analysis side.
-
-## known issues
-
-L1 SAEs are not state of the art anymore. JumpReLU (DeepMind) and top-k (Gao et al, OpenAI) both do better on the L0/MSE frontier. I picked L1 because it's the simplest thing that demonstrates the rest of this; in production I'd reach for top-k. Variance explained at this token budget reflects that - vanilla L1 at 500K tokens isn't competitive with current methods, but both training longer and switching the encoder are addressable. the TopK comparison landed the TopK encoder (with optional AuxK, `--activation topk`, see variants) and ran it once at the 500K recipe: FVU 0.378 / loss recovered 0.924 at k=32 against 0.628 / 0.789 for L1 at L0 28.4 (numbers) - the ReLU rows are kept as the history and the controlled baseline, TopK is the recipe going forward. the frontier sweep frontier settled the L0-matching question at 200M tokens: TopK is ahead of L1 at every width at matched L0, and at half the L0 matches it (numbers). AuxK is in the code and was on for every the frontier sweep TopK run, but only `topk_x16_k16` had any dead features at eval (1.4%), so whether AuxK is doing anything is still unmeasured - the pure-TopK ablation is a 3-run sweep. JumpReLU is not implemented.
-
-`l1_coefficient=5e-3` was tuned under the per-token contract, where it gave L0 ~27-43. Under the scalar contract it gives L0 ~17 (and the data path calibration change - position 0 out of the mean - will shift it again). the frontier sweep sweep measured it at the 200M-token / lr 4e-4 recipe: lambda 5e-3 gives L0 13-15 at every width, 2.5e-3 gives 35-37, 1e-2 collapses to L0 4 with ~40% dead - the bracket I predicted was ~2x too high in L0 (see sweep and numbers), which is exactly the re-tuning problem TopK removes; `sweeps/frontier_fill.json` extends the L1 curve to L0 20-60.
-
-The analysis corpus (`build_activation_cache`, fed by the first 200 documents streamed from `--analysis-dataset` in `main.py` - `monology/pile-uncopyrighted`, the shard corpus, unshuffled, since the default recipe; before that a separate 10K-document Pile sample) is still not document-disjoint from training. The FVU eval set moved onto the held-out shard in the data path (`eval.py`, and `main.py` after training); moving the analysis cache there too is a follow-up because it needs strings for `token_strings` and packed windows re-tokenized with `prepend_bos` would double-BOS.
-
-Layer 8 is a guess from probing literature on GPT-2-small. A real choice would grid-search 6-10 at fixed token budget and pick the layer with the lowest reconstruction at a target L0.
-
-**Throughput: A10 gate met at `--batch-tokens 2048` (107K), 10% short at the 512 recipe (90K; 88.5K when re-run in the TopK comparison session - the loader alone came out at 126K vs 128K, so that is session noise, not a regression from the TopK comparison code, which does not touch the loader and the bench still builds the ReLU SAE).** The TopK step was measured only as a by-product of the frontier sweep sweep (~11% dearer than ReLU at 4x); `bench_pipeline.py` and `profile_sae.py` take `--activation topk --k K` since the default recipe, so an isolated TopK bench / per-op profile is a one-liner that has not been run yet. the data path lifted the A10 from ~22.7K tok/s (on-the-fly) to 66K end-to-end with TransformerLens; the data-path rebuild's HF SDPA forward (`--forward hf`, TL-equivalent to 1e-4 on the real weights and reproducing the data path's FVU/L0/features exactly end to end) takes the loader alone from 82K to 128K and end-to-end to 90K at batch 512 / 107K at batch 2048, against the 100K A10 target (300K for an A100 - not measured, no A100 run yet). The pipeline is GPU-bound - 100% utilization, 0.3% of loader time on shard read + H2D - and the two remaining ceilings are the SAE step (~1.7 ms at 512, launch-overhead-bound) and an HF forward still at ~18 TFLOP/s effective. Batch 2048 is only a recipe for large token budgets (at 500K tokens it is 244 steps and FVU 0.82, see numbers); the default is now 4096 (default recipe, the sweep batch, where the gate is met - 102.6K tok/s for ReLU 4x in the frontier sweep sweep) and the 512 rows are history. Per the plan the gate is the go/no-go for the MVP run - the MVP run trains on the 220M shard at the default batch, where it passes; a fused / compiled SAE step is the cheap way to close the last 10% at 512 if anyone returns to it.
-
-The loader fills its whole buffer before the first step and refills at half, so it forwards roughly `buffer_tokens / 2` more tokens than training consumes; with the default 2M-row buffer (1M in the sweep) a 500K-token run spends most of its wall on that. Harmless for long runs, dominant for short ones - lower `--buffer-tokens` for those (`main.py` prints a note when the buffer exceeds `--n-tokens`).
-
-`ActivationLoader` runs GPT-2 under bf16 autocast on CUDA. `build_activation_cache` (analysis) runs fp32, so analysis-side activations differ from what the SAE trained on by bf16 matmul noise (~0.5%); harmless for feature ranking, but an exact-numerics comparison between training and analysis should set `autocast=False` in the loader.
-
-In-memory feature cache. `(total_tokens, n_features)` in RAM is fine for 100 texts. The layout (flat token array plus per-text offsets) maps cleanly onto Parquet sharded by feature index when this becomes the bottleneck.
-
-Cosmetic, visible in the logs: `HookedTransformer.from_pretrained` is deprecated in transformer_lens 3.x in favour of `TransformerBridge` (the hook name is unaffected); and `training_history.png` shows the dead-feature count spiking to 3072 at steps 250/500/750 - the count is logged right after the fixed-window counter is zeroed at a resample step, so that is a logging-order artifact, not features dying.
+- **200M tokens per run** against the 300M-1B+ of published SAE work.
+  At this budget end-of-training and held-out MSE agree - scaled
+  reconstruction MSE 0.1540 at the last training step vs 0.1556 held
+  out for `a6_default` (`train_log.jsonl` last row vs `metrics.json`),
+  0.0641 vs 0.0649 for `topk_x16_k64` - so nothing is memorising, and
+  the frontier could keep moving with tokens.
+- **One seed (42) per frontier cell.** The seed replicate
+  (`results/seeds/`) covers only the two 4x recipes - spread under
+  0.001 of 1-FVU there - and seeds vary the init and shuffle, not the
+  data; wider dictionaries and other corpora are unreplicated. Every
+  row also shares one hook, one held-out shard and one evaluator:
+  clean comparison, no second data source.
+- **Layer 8 only**, chosen from probing literature; a real choice would
+  grid-search layers 6-10 at fixed budget and target L0.
+- **The L1 bracket landed low** (L0 4-37 instead of the targeted
+  15-60): lambda bites much harder at 200M tokens / lr 4e-4 than the
+  small-budget tuning predicted - exactly the re-tuning coupling TopK
+  removes. `sweeps/frontier_fill.json` (lambda 1.6e-3, 3.5e-3 per
+  width) is written but has not run.
+- **AuxK's contribution is unattributed.** It was on for every TopK
+  sweep run and did engage transiently (nonzero aux loss well inside
+  counting windows; `results/SUMMARY.md`), and only `topk_x16_k16` kept
+  any eval-dead features (1.4%) - but the pure-TopK ablation that would
+  attribute that survival to AuxK has not run.
+- **L1 loses features with width at fixed lambda**: eval-dead 0.2% ->
+  1.0% -> 6.8% at lambda 5e-3 across 4x / 8x / 16x, and on
+  `relu_x16_l1-mid` features died faster than the 5000-step window
+  could flag them (77 resampled, accelerating; 835 dead at eval). A
+  shorter window or AuxK-style pressure is the concrete fix before
+  training L1 wider. JumpReLU is not implemented.
+- **The analysis corpus is not document-disjoint from training** (the
+  first documents of the same streamed corpus); moving it onto the
+  held-out shard needs strings, and re-tokenizing packed windows with
+  `prepend_bos` would double-BOS.
+- **Throughput** is forward-bound at ~144K tok/s on the A10 and
+  SAE-step-bound above 4x (the 100K gate passes at 4x, 95K at 8x, 53K
+  end-to-end at 16x TopK); a fused optimizer / `torch.compile` of the
+  step and of the hf block loop are untried, and there are no A100
+  numbers.
+- **Training-time activations are bf16-autocast** (a ~0.5% perturbation
+  against the fp32 activations the evaluator uses - far below the SAE's
+  own error); an exact-numerics comparison should set `autocast=False`
+  in the loader.
+- The frontier and seed `metrics.json` files predate the provenance
+  schema (no gpu_name / torch_version fields; the A10 attribution is
+  from the sweep logs), and `git_sha` is null for runs made
+  from a non-git working copy on the GPU host.
+- The in-memory feature cache is fine for 100 analysis texts and would
+  need a sharded layout (Parquet by feature) beyond that. Cosmetic:
+  `HookedTransformer.from_pretrained` prints a TransformerLens 3.x
+  deprecation warning (the hook name is unaffected), and the
+  dead-feature curve in `training_history.png` spikes to n_features
+  right after each counter reset - a logging-order artifact, not
+  features dying.
